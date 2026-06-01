@@ -1,37 +1,35 @@
-"""Ray Core: cluster lifecycle.
+"""Ray Core：叢集連線。
 
-Two modes:
-  * Standalone — `ray.init(num_cpus=..., num_gpus=..., ...)` starts a fresh
-    local cluster with our project's resource caps.
-  * Attach — if `RAY_ADDRESS` env var is set (the ray-head compose service
-    does this), `ray.init(address=RAY_ADDRESS)` joins the running cluster.
+本專案所有任務都在 Docker 容器內執行（`docker compose exec ray-head python ...`）。
+容器啟動時已用 `ray start --head --num-cpus=16 --num-gpus=1` 把資源池建好，
+並在環境變數設了 RAY_ADDRESS=auto。
+
+所以這裡只需要做一件事：**接上那個現成的叢集**。
+不需要自己決定要配多少 CPU/GPU——資源池由容器的 ray-head 保證（16 核 + 1 GPU）。
 """
 
 import os
 
 import ray
 
-from src.config import (
-    RAY_HEAP_BYTES,
-    RAY_NUM_CPUS,
-    RAY_NUM_GPUS,
-    RAY_OBJECT_STORE_BYTES,
-)
 
+def init_ray(verbose: bool = True) -> None:
+    """接上正在執行的 Ray 叢集（容器內的 ray-head）。
 
-def init_ray() -> None:
+    重複呼叫安全：若已連線則直接返回，不會重複初始化。
+
+    Args:
+        verbose: 連上後印出叢集的資源池（CPU/GPU 總量），方便確認接到的是
+                 預期的 16 核 + 1 GPU。
+    """
     if ray.is_initialized():
         return
-    addr = os.environ.get("RAY_ADDRESS")
-    if addr:
-        ray.init(address=addr, ignore_reinit_error=True)
-    else:
-        ray.init(
-            num_cpus=RAY_NUM_CPUS,
-            num_gpus=RAY_NUM_GPUS,
-            object_store_memory=RAY_OBJECT_STORE_BYTES,
-            _memory=RAY_HEAP_BYTES,
-            include_dashboard=True,
-            dashboard_host="0.0.0.0",
-            ignore_reinit_error=True,
-        )
+
+    # 容器內 RAY_ADDRESS=auto；"auto" 會讓 Ray 自動找到本機正在跑的 head。
+    address = os.environ.get("RAY_ADDRESS", "auto")
+    ray.init(address=address, ignore_reinit_error=True)
+
+    if verbose:
+        res = ray.cluster_resources()
+        print(f"[init_ray] 已接上叢集 | "
+              f"CPU={res.get('CPU')} GPU={res.get('GPU')}")

@@ -64,12 +64,15 @@ docker compose down                                     # 關閉
 src/
 ├── core/         叢集連線（init_ray）
 ├── modeling/     YOLO11 模型載入（traffic / accident）
-└── data/
-    ├── augment.py 劣化增強（兩案共用，模擬高公局低畫質）
-    ├── traffic/   車流：UA-DETRAC → Ray Data pipeline（偵測）
-    ├── accident/  車禍：Roboflow CCTV → Ray Data pipeline（分類）
-    └── freeway/   高公局 CCTV 即時影像（來源）
-scripts/          進入點（collect_freeway.py …）
+├── data/
+│   ├── augment.py 劣化增強（兩案共用，模擬高公局低畫質）
+│   ├── traffic/   車流：UA-DETRAC → Ray Data pipeline（偵測）
+│   ├── accident/  車禍：Roboflow CCTV → Ray Data pipeline（分類）
+│   └── freeway/   高公局 CCTV 即時影像（來源）
+└── train/
+    ├── traffic/   Ray Train 偵測訓練（v8DetectionLoss）
+    └── accident/  Ray Train 分類訓練（CrossEntropy）
+scripts/          進入點（train_*.py / collect_freeway.py …）
 datasets/         資料（不進 git）
 ray_results/      Ray Train/Tune 產出
 ```
@@ -239,6 +242,32 @@ accident 標類別）；即時幾乎抓不到車禍正樣本，主要供 traffic
 - **訓練**：`epochs=100, patience=30, imgsz=640, batch=16`，通常 40~70 epoch 收斂。
 - **fine-tune 資料**：每鏡頭 100~200 張（多樣性 > 數量，要跨日夜/尖離峰/晴雨）。
 
+### train 模組（Ray Train）
+
+兩案套用**同一套 Ray Train 骨架**（TorchTrainer + train_loop_per_worker），
+差別只在 loss 與 batch 格式：
+
+| | traffic（偵測） | accident（分類） |
+|---|---|---|
+| worker | [traffic/worker.py](src/train/traffic/worker.py) | [accident/worker.py](src/train/accident/worker.py) |
+| loss | v8DetectionLoss | CrossEntropy |
+| batch 轉換 | pad → batch_idx/cls/bboxes（攤平去 padding） | label 直接用 |
+| 指標 | val_loss | val_acc |
+
+```powershell
+# 車禍分類（已驗證 ~90% val_acc）
+docker compose exec ray-head python scripts/train_accident.py --epochs 20
+# 車流偵測（骨架已通：先少序列驗證，再全量）
+docker compose exec ray-head python scripts/train_traffic.py --limit 5 --epochs 2
+docker compose exec ray-head python scripts/train_traffic.py --epochs 30
+```
+
+單 GPU：`ScalingConfig(num_workers=1, use_gpu=True)`，兩案不能同時訓練（搶 GPU）。
+checkpoint 存 `ray_results/<案>/`，依指標保留最佳 2 份。
+
+> traffic 單類 reshape：yolo11n.pt 是 COCO 80 類，用 `yolo11n.yaml(nc=1)` 重建、
+> 載入相容的預訓練權重（backbone/neck），偵測頭重學。
+
 ---
 
 ## 8. 現況與待辦
@@ -251,9 +280,10 @@ accident 標類別）；即時幾乎抓不到車禍正樣本，主要供 traffic
 | data/accident | ✅ Ray Data pipeline（sources / pipeline，分類）|
 | data/augment | ✅ 劣化增強（兩案共用）|
 | data/freeway | ✅ 抓取 + 收集完成（已收 1001 張 CCTV）|
-| train | ⏳ 待建（Ray Train TorchTrainer 吃 pipeline 訓練）|
+| train/accident | ✅ 完成，已訓練出 model（val_acc ~90%）|
+| train/traffic | ✅ 骨架完成（v8DetectionLoss 已通），待正式訓練 |
 | serve | ⏳ 待建（Ray Serve 即時推論 + 車禍連續確認）|
 | tune | ⏳ 待建（Ray Tune 超參搜尋）|
 
-**下一步**：實作 `train`——兩案的 Ray Data pipeline 都就緒，用 Ray Train（TorchTrainer）
-吃 pipeline 訓練 YOLO11n（traffic 偵測）/ YOLO11n-cls（accident 分類）。
+**下一步**：traffic 正式訓練出 model；之後做 `serve`（Ray Serve 即時推論 +
+車禍連續確認邏輯），把兩個 model 接上高公局 CCTV。

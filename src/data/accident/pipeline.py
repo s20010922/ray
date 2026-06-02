@@ -23,6 +23,10 @@ from src.modeling.accident import IMG_SIZE
 
 cv2.setNumThreads(1)
 
+# ImageNet normalize（yolo11n-cls 預訓練的輸入統計，讓預訓練權重發揮）
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32).reshape(3, 1, 1)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32).reshape(3, 1, 1)
+
 
 def _preprocess(batch: Dict[str, np.ndarray],
                 augment: bool) -> Dict[str, np.ndarray]:
@@ -44,7 +48,9 @@ def _preprocess(batch: Dict[str, np.ndarray],
         img = cv2.resize(img, (IMG_SIZE, IMG_SIZE),
                          interpolation=cv2.INTER_LINEAR)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        imgs.append(np.transpose(img, (2, 0, 1)))
+        img = np.transpose(img, (2, 0, 1))                  # CHW
+        img = (img - _IMAGENET_MEAN) / _IMAGENET_STD        # ImageNet normalize
+        imgs.append(img.astype(np.float32))
         labs.append(int(labels[i]))
 
     if not imgs:

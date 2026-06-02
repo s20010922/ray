@@ -1,0 +1,17 @@
+# 資料與大檔（不進版控）
+datasets/
+team edit/
+ray_results/
+*.pt
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+Thumbs.db

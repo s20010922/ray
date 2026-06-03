@@ -35,6 +35,9 @@ def main():
                     help="車禍報警門檻（拉高治 domain-gap 誤報；連續 3 幀超過才報）")
     ap.add_argument("--imgsz", type=int, default=960)
     ap.add_argument("--no-roi", action="store_true", help="關閉 ROI 幾何過濾")
+    ap.add_argument("--clip-dir",
+                    default="/workspace/datasets/accident/video/accident",
+                    help="車禍片段資料夾（注入驗證用）")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
@@ -49,6 +52,7 @@ def main():
         imgsz=args.imgsz,
         use_roi=not args.no_roi,
         accident_conf_th=args.accident_conf_th,
+        clip_dir=args.clip_dir,
     )
     serve.run(monitor, name="traffic_monitor", route_prefix="/")
 

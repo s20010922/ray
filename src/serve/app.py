@@ -64,7 +64,9 @@ class TrafficMonitor:
                  conf: float = 0.4,
                  imgsz: int = 960,
                  use_roi: bool = True,
-                 accident_conf_th: float = _ACC_CONF_TH_DEFAULT):
+                 accident_conf_th: float = _ACC_CONF_TH_DEFAULT,
+                 clip_dir: str =
+                 "/workspace/datasets/accident/video/accident"):
         from ultralytics import YOLO
 
         from src.infer.accident import find_best_accident_checkpoint
@@ -74,6 +76,11 @@ class TrafficMonitor:
         self.imgsz = imgsz
         self.use_roi = use_roi
         self.accident_conf_th = accident_conf_th
+        self.clip_dir = Path(clip_dir)
+
+        # 車禍片段注入狀態：{cam_id: cv2.VideoCapture}（驗證用，手動觸發）
+        self.inject_cap: Dict[str, "cv2.VideoCapture"] = {}
+        self.inject_clip: Dict[str, str] = {}   # {cam_id: 片段檔名（狀態顯示）}
 
         # Traffic 偵測：freeway best.pt 是 ultralytics 原生格式，直接 YOLO 載
         self.detector = YOLO(detector_weights)
@@ -151,6 +158,22 @@ class TrafficMonitor:
             },
         }
 
+    # ── 取得一幀：注入中讀車禍片段，否則抓即時串流（阻塞）──
+    def _grab_frame(self, cam_id: str, stream_url: str):
+        cap = self.inject_cap.get(cam_id)
+        if cap is not None:
+            ok, frame = cap.read()
+            if not ok:                       # 片段播完 → 循環回第一幀
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = cap.read()
+            if ok:
+                cv2.putText(frame, "INJECTED CLIP", (10, frame.shape[0] - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                return frame
+        # 即時串流
+        jpg = grab_jpeg_frame(stream_url)
+        return cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+
     # ── 背景輪詢迴圈 ──────────────────────────────────
     async def _poll_loop(self):
         loop = asyncio.get_event_loop()
@@ -158,10 +181,8 @@ class TrafficMonitor:
             t0 = time.time()
             for cam in FOCUS_CAMERAS:
                 try:
-                    jpg = await loop.run_in_executor(
-                        None, grab_jpeg_frame, cam.stream_url)
-                    img = cv2.imdecode(np.frombuffer(jpg, np.uint8),
-                                       cv2.IMREAD_COLOR)
+                    img = await loop.run_in_executor(
+                        None, self._grab_frame, cam.cctv_id, cam.stream_url)
                     if img is None:
                         continue
                     result = await loop.run_in_executor(
@@ -189,6 +210,52 @@ class TrafficMonitor:
                             headers={"Cache-Control": "no-cache"})
         return JSONResponse(entry["json"],
                             headers={"Cache-Control": "no-cache"})
+
+    # ── 車禍片段注入（驗證用，手動觸發）──────────────
+    @app.get("/clips")
+    def list_clips(self):
+        """列出可用車禍片段 + 目前注入狀態。"""
+        clips = sorted(p.name for p in self.clip_dir.glob("*.mp4"))
+        return JSONResponse({"clips": clips, "active": self.inject_clip})
+
+    @app.post("/inject/{cam_id}")
+    def inject(self, cam_id: str, clip: str = None):
+        """讓某鏡頭改播車禍片段（clip 省略則隨機挑一支）。"""
+        import random
+
+        valid = {c.cctv_id for c in FOCUS_CAMERAS}
+        if cam_id not in valid:
+            return JSONResponse({"error": f"未知鏡頭 {cam_id}"}, status_code=404)
+
+        clips = sorted(p.name for p in self.clip_dir.glob("*.mp4"))
+        if not clips:
+            return JSONResponse({"error": f"無片段於 {self.clip_dir}"},
+                                status_code=404)
+        name = clip or random.choice(clips)
+        path = self.clip_dir / name
+        if not path.exists():
+            return JSONResponse({"error": f"找不到片段 {name}"}, status_code=404)
+
+        old = self.inject_cap.pop(cam_id, None)
+        if old is not None:
+            old.release()
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            return JSONResponse({"error": f"無法開啟 {name}"}, status_code=500)
+        self.inject_cap[cam_id] = cap
+        self.inject_clip[cam_id] = name
+        self.acc_hist[cam_id].clear()        # 重置連續確認
+        return JSONResponse({"status": "injecting", "cam": cam_id, "clip": name})
+
+    @app.post("/inject/{cam_id}/clear")
+    def inject_clear(self, cam_id: str):
+        """取消注入，恢復即時串流。"""
+        cap = self.inject_cap.pop(cam_id, None)
+        if cap is not None:
+            cap.release()
+        self.inject_clip.pop(cam_id, None)
+        self.acc_hist[cam_id].clear()
+        return JSONResponse({"status": "cleared", "cam": cam_id})
 
 
 def build_app(args: dict = None):

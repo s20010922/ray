@@ -16,7 +16,9 @@
 5. [modeling — YOLO11 模型](#5-modeling--yolo11-模型)
 6. [data — 資料來源與管線](#6-data--資料來源與管線)
 7. [訓練策略](#7-訓練策略)
-8. [現況與待辦](#8-現況與待辦)
+8. [eval / infer — 評估與推論](#8-eval--infer--評估與推論)
+9. [高公局 fine-tune（知識蒸餾）](#9-高公局-fine-tune知識蒸餾)
+10. [現況與待辦](#10-現況與待辦)
 
 ---
 
@@ -68,17 +70,20 @@ src/
 │   ├── augment.py 劣化增強（兩案共用，模擬高公局低畫質）
 │   ├── traffic/   車流：UA-DETRAC → Ray Data pipeline（偵測）
 │   ├── accident/  車禍：Roboflow CCTV → Ray Data pipeline（分類）
-│   └── freeway/   高公局 CCTV 即時影像（來源）
-└── train/
-    ├── traffic/   Ray Train 偵測訓練（v8DetectionLoss）
-    └── accident/  Ray Train 分類訓練（CrossEntropy）
-scripts/          進入點（train_*.py / collect_freeway.py …）
+│   └── freeway/   高公局 CCTV：抓取(grabber) + ROI + 預標 + 切分
+├── train/
+│   ├── traffic/   Ray Train 偵測訓練（v8DetectionLoss）
+│   └── accident/  Ray Train 分類訓練（CrossEntropy）
+├── infer/        推論：自訓 base(traffic) + COCO 自動標(coco_vehicle)
+└── eval/         評估：mAP@0.5（traffic）
+scripts/          進入點（train_* / eval_traffic / prelabel_freeway / finetune_freeway …）
 datasets/         資料（不進 git）
-ray_results/      Ray Train/Tune 產出
+ray_results/      Ray Train 產出 + ultralytics fine-tune 產出
 ```
 
 依賴關係：`core.init_ray()` 先就緒 → `data` 串流資料 → `train` 吃資料訓練
-（用到 `modeling` 的模型）→ `serve` 推論。
+（用到 `modeling`）→ `infer` / `eval` 推論評估 →（高公局）`coco_vehicle` 自動標
+→ `finetune` 蒸餾 → `serve` 上線。
 
 ---
 
@@ -208,8 +213,12 @@ docker compose exec -d ray-head python scripts/collect_freeway.py --target-per-c
 
 > ⚠️ 是 **`abs2mjpg`** 不是 `abs2jpg`——路徑錯會回 403，易誤判成被擋。
 
-**限制**：CCTV 影像 352×240、**無標註**。要 fine-tune 得人工標（traffic 框車、
-accident 標類別）；即時幾乎抓不到車禍正樣本，主要供 traffic 與 accident 的負樣本。
+**限制**：CCTV 影像 352×240、**無標註**。traffic 的「無標註」已用第 9 章
+**COCO 自動標（知識蒸餾）**解決，零人工；accident 仍需人工標類別，且即時幾乎
+抓不到車禍正樣本，主要供 non-accident 負樣本。
+
+> 收集到的 2002 張中，`all pic/` 1001 張是 5 個 cam 的**完整副本**（檔名 100%
+> 重複），獨立資料實為 1001 張；白天 6–18 時有車的約 600 張為自動標/訓練主力。
 
 ---
 
@@ -221,11 +230,16 @@ accident 標類別）；即時幾乎抓不到車禍正樣本，主要供 traffic
 官方 yolo11n 預訓練
    │ ① 用 UA-DETRAC + 劣化增強 訓練（學會認車、不怕糊）
    ▼
-基礎模型（mAP@0.5 ~0.8 即可，別過擬合 UA-DETRAC）
-   │ ② 用標註過的高公局畫面 fine-tune（domain adaptation）
+base 模型（UA-DETRAC val mAP@0.5 ≈ 0.64，見第 8 章）
+   │ ② 高公局 fine-tune — 原計畫人工標註，實際改走「知識蒸餾」（見第 9 章）：
+   │    COCO yolo11x 自動標高公局 → 蒸餾 yolo11n（零人工、imgsz 960 letterbox）
    ▼
-貼合高公局的成品 → serve 即時推論
+貼合高公局的成品（高公局 val mAP@0.5 ≈ 0.85）→ serve 即時推論
 ```
+
+> **為何 base 不必很準**：base 只有兩個用途——當 fine-tune 起點、以及（原本要）
+> 拿來預標。實測 base 在高公局 domain gap 太大（夜間/小目標幾乎全漏），於是
+> 改用更強的官方 COCO 模型來自動標，base 退居「起點」角色（見第 9 章）。
 
 ### 為什麼這樣設計
 
@@ -268,9 +282,98 @@ checkpoint 存 `ray_results/<案>/`，依指標保留最佳 2 份。
 > traffic 單類 reshape：yolo11n.pt 是 COCO 80 類，用 `yolo11n.yaml(nc=1)` 重建、
 > 載入相容的預訓練權重（backbone/neck），偵測頭重學。
 
+**待補項目（已補上）**：
+
+| 項目 | base（Ray Train 自刻） | fine-tune（ultralytics，第 9 章） |
+|---|---|---|
+| early stopping | 仍跑固定 epochs | ✅ 內建 `patience`，自動早停 |
+| traffic 評估 mAP@0.5 | ✅ 事後用 [eval_traffic.py](scripts/eval_traffic.py) 算（第 8 章）| ✅ 訓練中內建 mAP |
+| letterbox / 大尺寸 | 640 直接 resize（變形）| ✅ imgsz 960 + letterbox |
+
+> 自刻 Ray detection loop 缺的（mAP / early-stop / letterbox），fine-tune 階段
+> 改用 **ultralytics 原生 train** 一次補齊，不重造輪子。base 的 mAP 則用獨立的
+> `eval/` 模組事後評估。
+
 ---
 
-## 8. 現況與待辦
+## 8. eval / infer — 評估與推論
+
+程式：[eval/traffic.py](src/eval/traffic.py)、[infer/traffic.py](src/infer/traffic.py)、
+[infer/coco_vehicle.py](src/infer/coco_vehicle.py)、[scripts/eval_traffic.py](scripts/eval_traffic.py)
+
+### 8.1 eval — mAP@0.5
+
+自寫單類 mAP@0.5（VOC all-point 積分），直接吃 records + 推論結果，不需 ultralytics
+資料夾格式。補上自刻 Ray Train 缺的偵測標準指標。
+
+```powershell
+docker compose exec ray-head python scripts/eval_traffic.py   # mAP + 畫框可視化
+```
+
+> base（UA-DETRAC 訓練）在 UA-DETRAC val：**mAP@0.5 ≈ 0.64**。近處大車準、
+> 遠處小車漏（640 直接 resize 變形 + nano 容量）——這弱點在高公局更嚴重，
+> 促成第 9 章改走自動標。
+
+### 8.2 infer — 推論
+
+| 程式 | 用途 |
+|---|---|
+| [traffic.py](src/infer/traffic.py) | 載入自刻 Ray Train 存的 `model.pt`，重建 DetectionModel + NMS → bbox（預處理須與訓練一致：640 直接 resize）|
+| [coco_vehicle.py](src/infer/coco_vehicle.py) | 官方 YOLO11 COCO 模型，car/bus/truck/機車 → Vehicle，供第 9 章自動標 |
+
+---
+
+## 9. 高公局 fine-tune（知識蒸餾）
+
+**核心轉折**：base 在高公局 domain gap 太大（夜間/小目標幾乎全漏），原計畫的
+「base 預標 + 人工修」不可行。改用「**大模型自動標 → 小模型蒸餾**」，零人工。
+
+```
+COCO yolo11x（老師）── 自動標高公局白天 600 張 ──→ YOLO labels
+                                                    │ ② ultralytics fine-tune
+官方 yolo11n.pt（起點）─────────────────────────────┴─→ yolo11n（學生，上線）
+```
+
+老師（yolo11x）標完即丟，上線只用學生（yolo11n）。yolo11n 的能力透過「標籤」
+間接學自 yolo11x，訓練時不載入 yolo11x。
+
+### 程式
+
+| 程式 | 職責 |
+|---|---|
+| [coco_vehicle.py](src/infer/coco_vehicle.py) | 官方 yolo11x 自動標（COCO car/bus/truck→Vehicle）|
+| [prelabel.py](src/data/freeway/prelabel.py) | 跑自動標 → YOLO labels + preview + classes.txt（可切換 base / COCO）|
+| [roi.py](src/data/freeway/roi.py) | per-cam 偵測範圍（固定機位）|
+| [split.py](src/data/freeway/split.py) | 依 cam 分層切 train/val → ultralytics 結構 |
+| [finetune_freeway.py](scripts/finetune_freeway.py) | ultralytics train（imgsz 960 letterbox、單類、early-stop）|
+
+### 指令
+
+```powershell
+# ① COCO 自動標白天圖（6–18 時，--no-roi 標所有車）
+docker compose exec ray-head python scripts/prelabel_freeway.py --coco --no-roi
+# ② fine-tune（蒸餾）
+docker compose exec ray-head python scripts/finetune_freeway.py --epochs 100
+```
+
+### 成果（200 張驗證版）
+
+- 自動標品質：base 3.8 框/張 → **COCO yolo11x 11.6 框/張**（中遠景小車都抓到）
+- fine-tune yolo11n：高公局 val **mAP@0.5 ≈ 0.85 / mAP50-95 ≈ 0.72**，40 epoch 早停
+- **零人工標註**；已擴大自動標到全白天 600 張，待重訓
+
+### ROI（偵測範圍）
+
+CCTV 固定機位，可為每支 cam 定多邊形 ROI，排除遠景糊區/對向車道、界定車流計數區。
+**標註/訓練階段不套**（`--no-roi`，標所有車，人天然只標看得清的）；ROI 留到
+**推論階段**做幾何過濾。
+
+> labelImg 備註：Python 3.14 + 新 PyQt5 需手動修數處 `float→int`
+> （labelImg.py / canvas.py），且 `classes.txt` 要放在 save_dir（labels/）。
+
+---
+
+## 10. 現況與待辦
 
 | 模組 | 狀態 |
 |---|---|
@@ -279,11 +382,13 @@ checkpoint 存 `ray_results/<案>/`，依指標保留最佳 2 份。
 | data/traffic | ✅ Ray Data pipeline（sources / pipeline，偵測）|
 | data/accident | ✅ Ray Data pipeline（sources / pipeline，分類）|
 | data/augment | ✅ 劣化增強（兩案共用）|
-| data/freeway | ✅ 抓取 + 收集完成（已收 1001 張 CCTV）|
+| data/freeway | ✅ 抓取（1001 張獨立）+ ROI + 自動標 + 切分 |
 | train/accident | ✅ 完成，已訓練出 model（val_acc ~90%）|
-| train/traffic | ✅ 骨架完成（v8DetectionLoss 已通），待正式訓練 |
-| serve | ⏳ 待建（Ray Serve 即時推論 + 車禍連續確認）|
+| train/traffic | ✅ base 已正式訓練（val_loss 51.95；UA-DETRAC val mAP@0.5 ≈ 0.64）|
+| eval / infer | ✅ mAP@0.5 評估 + 推論（自訓 / COCO）|
+| 高公局 fine-tune | ✅ 知識蒸餾驗證（200 張，高公局 val mAP@0.5 ≈ 0.85）；已擴大標 600 張，**待重訓** |
+| serve | ⏳ 待建（Ray Serve 即時推論 + 車禍連續確認 + ROI 過濾）|
 | tune | ⏳ 待建（Ray Tune 超參搜尋）|
 
-**下一步**：traffic 正式訓練出 model；之後做 `serve`（Ray Serve 即時推論 +
-車禍連續確認邏輯），把兩個 model 接上高公局 CCTV。
+**下一步**：用全白天 600 張**重訓** fine-tune（擴大版）；之後做 `serve`
+（Ray Serve 即時推論 + 車禍連續確認 + 推論套 ROI），把兩個 model 接上高公局 CCTV。

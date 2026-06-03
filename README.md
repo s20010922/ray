@@ -1,394 +1,367 @@
-# Ray｜高速公路 CCTV 車流 / 車禍偵測
+# 高速公路 CCTV 車流／車禍即時偵測系統
 
-用 Ray（Data / Train / Tune / Serve）在 Docker 上，建一套以 YOLO11 為核心的
-交通偵測系統：偵測高公局即時 CCTV 的**車流**與**車禍**。
-
-> 本文件是專案的單一說明入口，分章節對應各模組程式碼。
+以 **Ray**（Data／Train／Tune／Serve）與 **YOLO11** 為核心，在 Docker 環境中建置的
+交通智慧監控系統。針對台灣高速公路局即時 CCTV（固定機位、352×240 低畫質），
+提供**車流密度偵測**與**車禍事件判斷**，並透過即時監控儀表板呈現。
 
 ---
 
 ## 目錄
 
-1. [專案目標](#1-專案目標)
-2. [環境與啟動](#2-環境與啟動)
-3. [架構總覽](#3-架構總覽)
-4. [core — 叢集連線](#4-core--叢集連線)
-5. [modeling — YOLO11 模型](#5-modeling--yolo11-模型)
-6. [data — 資料來源與管線](#6-data--資料來源與管線)
-7. [訓練策略](#7-訓練策略)
-8. [eval / infer — 評估與推論](#8-eval--infer--評估與推論)
-9. [高公局 fine-tune（知識蒸餾）](#9-高公局-fine-tune知識蒸餾)
-10. [現況與待辦](#10-現況與待辦)
+1. [系統總覽](#1-系統總覽)
+2. [環境需求](#2-環境需求)
+3. [快速開始](#3-快速開始)
+4. [資料準備](#4-資料準備)
+5. [模型訓練](#5-模型訓練)
+6. [模型評估](#6-模型評估)
+7. [即時監控服務](#7-即時監控服務)
+8. [專案結構](#8-專案結構)
+9. [效能總結](#9-效能總結)
+10. [已知限制](#10-已知限制)
+11. [指令速查](#11-指令速查)
 
 ---
 
-## 1. 專案目標
+## 1. 系統總覽
 
-| 任務 | 型態 | 模型 | 最終部署 |
-|---|---|---|---|
-| 車流偵測 | 物件偵測 | YOLO11n | 高公局 CCTV 即時車流密度 |
-| 車禍偵測 | 影像分類 | YOLO11n-cls | 高公局 CCTV 即時事故判斷 |
+### 1.1 三項任務
 
-資料來源最終是**高公局高速公路 CCTV**（固定監控、352×240 低畫質、台灣道路）。
+本系統包含兩個獨立 base 模型與一個微調模型：
+
+| 任務 | 型態 | 模型 | 訓練資料 | 角色 |
+|------|------|------|----------|------|
+| **車禍偵測**（Accident） | 影像分類 | YOLO11n-cls | Roboflow CCTV 車禍圖 | 獨立 base 模型 |
+| **車流偵測**（Traffic） | 物件偵測 | YOLO11n | UA-DETRAC | 偵測 base 模型 |
+| **高公局微調**（Freeway） | 物件偵測 | YOLO11n | 高公局 CCTV（自動標註） | Traffic base 的蒸餾微調版 |
+
+> Freeway 並非第三個獨立模型，而是以知識蒸餾（teacher `yolo11x` 自動標註高公局影像，
+> student `yolo11n` 微調）讓 Traffic base 適應高公局場景的產物。
+
+### 1.2 Ray 技術堆疊
+
+| 元件 | 用途 |
+|------|------|
+| **Ray Data** | 串流式資料管線（解碼、劣化增強、多 CPU 平行前處理） |
+| **Ray Train** | 分散式訓練（`TorchTrainer`，Accident 與 Traffic base） |
+| **Ray Tune** | 超參數搜尋（Freeway 微調，ASHA 排程器） |
+| **Ray Serve** | 即時推論服務（多鏡頭輪詢、HTTP API、監控儀表板） |
+
+### 1.3 資料流
+
+```
+公開資料集 ──► Ray Data 管線 ──► Ray Train ──► base 模型
+（UA-DETRAC、         （劣化增強模擬               │
+  Roboflow）           高公局低畫質）              │
+                                                   ▼
+高公局 CCTV ──► yolo11x 自動標註 ──► Ray Tune 微調 ──► Freeway 模型
+                （知識蒸餾）         （超參搜尋）         │
+                                                          ▼
+                                            Ray Serve 即時監控儀表板
+```
 
 ---
 
-## 2. 環境與啟動
+## 2. 環境需求
 
-**硬體**：RTX 3060 Ti（8GB）、12 核 / 20 緒、32GB RAM。
-**容器**：CUDA 12.1 + Python 3.10 + Ray 2.40 + PyTorch（見 [Dockerfile](Dockerfile)）。
+### 2.1 硬體
 
-所有任務都在容器內跑。`ray-head` 啟動時建好資源池（CPU 16 / GPU 1），
-設定見 [docker-compose.yml](docker-compose.yml)。
+| 項目 | 規格 |
+|------|------|
+| GPU | NVIDIA RTX 3060 Ti（8 GB VRAM） |
+| CPU／RAM | 12 核 20 緒／32 GB |
+
+### 2.2 軟體
+
+容器映像（見 [Dockerfile](Dockerfile)）：CUDA 12.1 + Python 3.10 + 下列主要套件
+（完整清單見 [requirements.txt](requirements.txt)）：
+
+| 套件 | 版本 |
+|------|------|
+| PyTorch | 2.5.1+cu121 |
+| Ray | 2.40.0（`[default,train,data,serve]`） |
+| Ultralytics | 8.3.40 |
+| OpenCV | 4.10.0.84 |
+
+### 2.3 資料掛載（[docker-compose.yml](docker-compose.yml)）
+
+| 主機路徑 | 容器路徑 | 權限 | 用途 |
+|----------|----------|------|------|
+| `F:/dataset` | `/data/detrac` | 唯讀 | UA-DETRAC 原始資料 |
+| `./datasets` | `/workspace/datasets` | 可寫 | 轉檔資料、抓取的 CCTV 影像 |
+| `./src` | `/workspace/src` | 唯讀 | 原始碼 |
+| `./scripts` | `/workspace/scripts` | 唯讀 | 進入點腳本 |
+| `./ray_results` | `/workspace/ray_results` | 可寫 | 訓練／微調輸出 |
+
+### 2.4 對外連接埠
+
+| 連接埠 | 服務 |
+|--------|------|
+| 8265 | Ray Dashboard |
+| 8000 | Ray Serve HTTP（監控儀表板 + API） |
+| 8501 | 備用 |
+
+---
+
+## 3. 快速開始
 
 ```powershell
-docker compose up -d ray-head                          # 啟動叢集
-# dashboard: http://localhost:8265
-docker compose exec ray-head python scripts/你的腳本.py  # 跑任務
-docker compose down                                     # 關閉
+# 1. 啟動 Ray 叢集（背景常駐，資源池 CPU 16 / GPU 1）
+docker compose up -d ray-head
+
+# 2. 切分資料（隔離 held-out test set）
+docker compose exec ray-head python -m src.data.accident.split `
+    --src /workspace/datasets/accident/Image --out /workspace/datasets/accident
+
+# 3. 訓練（擇一）
+docker compose exec ray-head python scripts/train_accident.py --epochs 50
+docker compose exec ray-head python scripts/train_traffic.py  --epochs 30
+
+# 4. 評估（在 held-out test set 上）
+docker compose exec ray-head python scripts/eval_accident.py
+docker compose exec ray-head python scripts/eval_traffic.py
+
+# 5. 啟動即時監控服務
+docker compose exec ray-head python scripts/serve_dashboard.py
+#    開啟瀏覽器：http://localhost:8000/
+
+# 關閉叢集
+docker compose down
 ```
 
-**資料掛載**（docker-compose.yml）：
-
-| 主機 | 容器 | 用途 |
-|---|---|---|
-| `F:/dataset` | `/data/detrac`（唯讀） | UA-DETRAC 原始資料 |
-| `./datasets` | `/workspace/datasets`（可寫） | 轉檔資料、抓到的 CCTV |
-| `./src` | `/workspace/src`（唯讀） | 程式碼 |
-
-> ⚠️ 圖片**不能**存進唯讀的 `src/`，一律存 `datasets/`。
+所有任務皆於容器內執行。Ray Dashboard 位於 http://localhost:8265。
 
 ---
 
-## 3. 架構總覽
+## 4. 資料準備
 
-```
-src/
-├── core/         叢集連線（init_ray）
-├── modeling/     YOLO11 模型載入（traffic / accident）
-├── data/
-│   ├── augment.py 劣化增強（兩案共用，模擬高公局低畫質）
-│   ├── traffic/   車流：UA-DETRAC → Ray Data pipeline（偵測）
-│   ├── accident/  車禍：Roboflow CCTV → Ray Data pipeline（分類）
-│   └── freeway/   高公局 CCTV：抓取(grabber) + ROI + 預標 + 切分
-├── train/
-│   ├── traffic/   Ray Train 偵測訓練（v8DetectionLoss）
-│   └── accident/  Ray Train 分類訓練（CrossEntropy）
-├── infer/        推論：自訓 base(traffic) + COCO 自動標(coco_vehicle)
-└── eval/         評估：mAP@0.5（traffic）
-scripts/          進入點（train_* / eval_traffic / prelabel_freeway / finetune_freeway …）
-datasets/         資料（不進 git）
-ray_results/      Ray Train 產出 + ultralytics fine-tune 產出
-```
+### 4.1 Held-out Test Set 設計
 
-依賴關係：`core.init_ray()` 先就緒 → `data` 串流資料 → `train` 吃資料訓練
-（用到 `modeling`）→ `infer` / `eval` 推論評估 →（高公局）`coco_vehicle` 自動標
-→ `finetune` 蒸餾 → `serve` 上線。
+為提供可信的評估指標，三組資料集皆切分為 **train／val／test** 三份，其中 **test
+集在訓練全程完全不可見**，僅供最終評估使用一次。隔離粒度依資料特性而異，以避免
+相似樣本跨 split 洩漏：
 
----
+| 任務 | 切分程式 | 隔離粒度 | 切分結果 |
+|------|----------|----------|----------|
+| Accident | [accident/split.py](src/data/accident/split.py) | 圖片級（按類別分層） | train 300／val 62／test 62（皆 1:1 平衡） |
+| Traffic | [traffic/split.py](src/data/traffic/split.py) | 序列級（同序列幀不跨 split） | train 36／val 12／test 12 序列 |
+| Freeway | [freeway/split.py](src/data/freeway/split.py) | 鏡頭級（同鏡頭幀不跨 split） | train 384／val 96／test 120（整鏡頭隔離） |
 
-## 4. core — 叢集連線
+### 4.2 資料來源
 
-程式：[src/core/cluster.py](src/core/cluster.py)
+| 資料集 | 內容 | 說明 |
+|--------|------|------|
+| UA-DETRAC | 100 序列交通監控影像 | 視角貼近高公局；自訂 XML 標註，依序列抽幀降冗餘 |
+| Roboflow Accident | 平衡車禍／非車禍分類圖 | 原始 `Image/` 共 424 張（212:212） |
+| 高公局 CCTV | 5 支 focus 鏡頭 MJPEG | 由 grabber 抓取，yolo11x 自動標註 |
 
-唯一職責：**接上容器內正在跑的 `ray-head`**。資源池（16 CPU / 1 GPU）由
-容器的 `ray start` 保證，core 不碰資源數字。
+### 4.3 劣化增強
 
-```python
-from src.core.cluster import init_ray
-init_ray()      # 有 RAY_ADDRESS=auto → 接上現成叢集；重複呼叫安全
-```
-
-| 設計 | 原因 |
-|---|---|
-| 只做 attach、不自己開叢集 | 任務都在容器跑，資源池已由 ray-head 定好 |
-| 不碰 CPU/GPU 數字 | 避免「容器一套、core 又一套」不一致 |
+訓練時對影像施加降解析度、JPEG 壓縮、模糊、噪點、亮度對比抖動
+（[src/data/augment.py](src/data/augment.py)），模擬高公局低畫質 CCTV，使模型在部署
+時能適應糊化畫面。**僅作用於 train，val／test 不增強。**
 
 ---
 
-## 5. modeling — YOLO11 模型
+## 5. 模型訓練
 
-程式：[traffic.py](src/modeling/traffic.py)、[accident.py](src/modeling/accident.py)
-
-沿用 team edit 的任務設定，模型升級到 YOLO11n。
-
-| 檔案 | 任務 | 模型 | imgsz | 類別 |
-|---|---|---|---|---|
-| `traffic.py` | 偵測 | `yolo11n.pt` | 640 | `Vehicle`（1 類）|
-| `accident.py` | 分類 | `yolo11n-cls.pt` | 224 | `accident` / `non-accident` |
-
-```python
-from src.modeling.traffic import load_traffic_model, IMG_SIZE, CLASSES
-det = load_traffic_model()                    # 官方預訓練
-det = load_traffic_model(".../best.pt")        # 自訓練微調模型
-```
-
-**重要**：預設載的是官方預訓練（COCO / ImageNet），是「起點」非「成品」。
-`CLASSES` 是「目標類別」，要訓練後才成立。`yolo11n-cls.pt` 完全不認得車禍，
-非訓練不可。
-
----
-
-## 6. data — 資料來源與管線
-
-### 6.1 概觀
-
-`traffic` / `accident` 是**任務**，`freeway` 是**來源**。一段高公局畫面可
-同時餵兩個任務：
-
-```
-高公局 CCTV (freeway/)  ──→ traffic  車流偵測（偵測）
-                        └─→ accident 車禍判斷（分類）
-```
-
-兩案結構**對稱**（各有 sources + pipeline），**劣化增強 [augment.py](src/data/augment.py)
-共用**——兩案都部署在高公局低畫質 CCTV，需要同樣的低畫質適應。
-
-| 子模組 | 內容 | 狀態 |
-|---|---|---|
-| `traffic/` | UA-DETRAC → Ray Data pipeline（偵測） | ✅ 可用 |
-| `accident/` | Roboflow CCTV → Ray Data pipeline（分類） | ✅ 可用 |
-| `freeway/` | CCTV MJPEG 抓取 | ✅ 可用 |
-| `augment.py` | 劣化增強（兩案共用） | ✅ 可用 |
-
-### 6.2 traffic — UA-DETRAC + Ray Data pipeline
-
-**資料集**：UA-DETRAC（14 萬張、100 序列、交通監控視角，貼近高公局）。
-標註是自訂 XML（box 像素 + 車種），需轉換。
-
-走 **Ray Data 串流管線**（路 B），真正用到 Ray 的串流 + 多 CPU 平行：
-
-```
-DETRAC XML
-  └ sources.list_detrac_records(frame_stride=10)   ← 解析 + 抽幀 → records(~1.4萬)
-       └ pipeline.build_ray_dataset(augment=True)   ← Ray Data 串流，多 CPU 平行
-            ├ 解碼 → 劣化增強 → 水平翻轉 → resize 640 → 正規化 → pad
-            └ 輸出 image(3,640,640) + boxes_xywhn(100,4) + labels(100)
-```
-
-| 程式 | 職責 |
-|---|---|
-| [sources.py](src/data/traffic/sources.py) | XML → records（含**抽幀**降冗餘、依序列切 train/val）|
-| [pipeline.py](src/data/traffic/pipeline.py) | Ray Data 串流：解碼 / 劣化增強（共用 [augment](src/data/augment.py)）/ 翻轉 / resize / pad |
-| [detrac_to_yolo.py](src/data/traffic/detrac_to_yolo.py) | 另一條路：轉成 YOLO 檔案格式（給 ultralytics 內建訓練用）|
-
-**劣化增強**（只在 train，val 不增強）：降解析度、JPEG 壓縮、模糊（高斯/中值/平均/動態）、
-噪點、亮度對比——讓模型訓練時就見過低畫質，上線才認得高公局的糊畫面。
-
-關鍵參數：`frame_stride=10`（抽幀，約 1.4 萬張）、`MAX_BOXES=100`、
-`val_ratio=0.2`（依序列切，不洩漏）、單類 Vehicle。
-
-### 6.3 accident — 車禍分類
-
-**資料集**：[datasets/accident](datasets/accident)（Roboflow 匯出、土耳其 Adıyaman
-CCTV 監控視角，貼近高公局）。已是分好的分類資料夾，**不需轉換器**。
-
-| 程式 | 職責 |
-|---|---|
-| [sources.py](src/data/accident/sources.py) | 列檔 `{train,val}/{accident,non-accident}/` → records `{image_path, label}` |
-| [pipeline.py](src/data/accident/pipeline.py) | Ray Data 串流：解碼 / 劣化增強（共用 [augment](src/data/augment.py)）/ 翻轉 / resize 224 |
-
-規模：原始 424 張、train 527 / val 95、測試影片 202 部。
-label：`0=accident, 1=non-accident`。
-
-比 traffic 簡單：分類**沒有 bbox**，翻轉不需變換座標、也不用 pad。
-
-**車禍偵測的時序邏輯**（部署時）：單幀分類易誤判，要**連續多幀都高信心
-判為 accident** 才算偵測到車禍事件（並記錄發生時間）。這個「連續確認」邏輯
-之後寫在 serve（即時推論）。
-
-### 6.4 freeway — 高公局 CCTV
-
-程式：[grabber.py](src/data/freeway/grabber.py)、收集器 [scripts/collect_freeway.py](scripts/collect_freeway.py)
-
-核心是 `grab_jpeg_frame(stream_url)`——從 MJPEG 串流抽單張 JPEG（找 FFD8/FFD9）。
-收集與即時推論共用它。
+### 5.1 車禍分類（Ray Train）
 
 ```powershell
-# 背景定時收集，每鏡頭目標 200 張，達標自動停
-docker compose exec -d ray-head python scripts/collect_freeway.py --target-per-camera 200
+docker compose exec ray-head python scripts/train_accident.py --epochs 50
 ```
 
-5 支 focus 鏡頭（國1/國3，串流 `https://cctvn.freeway.gov.tw/abs2mjpg/bmjpg?camera=<id>`）。
+- 起點權重 `yolo11n-cls.pt`，輸入 224×224，二元分類。
+- 僅載入 train／val，test 完全隔離；依 `val_acc` 保留最佳 checkpoint。
 
-> ⚠️ 是 **`abs2mjpg`** 不是 `abs2jpg`——路徑錯會回 403，易誤判成被擋。
-
-**限制**：CCTV 影像 352×240、**無標註**。traffic 的「無標註」已用第 9 章
-**COCO 自動標（知識蒸餾）**解決，零人工；accident 仍需人工標類別，且即時幾乎
-抓不到車禍正樣本，主要供 non-accident 負樣本。
-
-> 收集到的 2002 張中，`all pic/` 1001 張是 5 個 cam 的**完整副本**（檔名 100%
-> 重複），獨立資料實為 1001 張；白天 6–18 時有車的約 600 張為自動標/訓練主力。
-
----
-
-## 7. 訓練策略
-
-### 路線圖
-
-```
-官方 yolo11n 預訓練
-   │ ① 用 UA-DETRAC + 劣化增強 訓練（學會認車、不怕糊）
-   ▼
-base 模型（UA-DETRAC val mAP@0.5 ≈ 0.64，見第 8 章）
-   │ ② 高公局 fine-tune — 原計畫人工標註，實際改走「知識蒸餾」（見第 9 章）：
-   │    COCO yolo11x 自動標高公局 → 蒸餾 yolo11n（零人工、imgsz 960 letterbox）
-   ▼
-貼合高公局的成品（高公局 val mAP@0.5 ≈ 0.85）→ serve 即時推論
-```
-
-> **為何 base 不必很準**：base 只有兩個用途——當 fine-tune 起點、以及（原本要）
-> 拿來預標。實測 base 在高公局 domain gap 太大（夜間/小目標幾乎全漏），於是
-> 改用更強的官方 COCO 模型來自動標，base 退居「起點」角色（見第 9 章）。
-
-### 為什麼這樣設計
-
-| 事實 | 對策 |
-|---|---|
-| 高公局 352×240 低畫質，UA-DETRAC 960×540 清晰 | **劣化增強**模擬低畫質 |
-| UA-DETRAC 影片拆幀、相鄰幀重複 | **抽幀** stride 10 |
-| 這是基礎模型，之後 fine-tune | 堪用即可，力氣留給 fine-tune |
-| 高公局即時串流無標註 | 先用公開資料訓練，少量人工標註再微調 |
-
-### 資料量與訓練程度
-
-- **車流資料量**：全 100 序列（多樣性）× 抽幀 10 ≈ 1.4 萬張。
-- **訓練**：`epochs=100, patience=30, imgsz=640, batch=16`，通常 40~70 epoch 收斂。
-- **fine-tune 資料**：每鏡頭 100~200 張（多樣性 > 數量，要跨日夜/尖離峰/晴雨）。
-
-### train 模組（Ray Train）
-
-兩案套用**同一套 Ray Train 骨架**（TorchTrainer + train_loop_per_worker），
-差別只在 loss 與 batch 格式：
-
-| | traffic（偵測） | accident（分類） |
-|---|---|---|
-| worker | [traffic/worker.py](src/train/traffic/worker.py) | [accident/worker.py](src/train/accident/worker.py) |
-| loss | v8DetectionLoss | CrossEntropy |
-| batch 轉換 | pad → batch_idx/cls/bboxes（攤平去 padding） | label 直接用 |
-| 指標 | val_loss | val_acc |
+### 5.2 車流偵測（Ray Train）
 
 ```powershell
-# 車禍分類（已驗證 ~90% val_acc）
-docker compose exec ray-head python scripts/train_accident.py --epochs 20
-# 車流偵測（骨架已通：先少序列驗證，再全量）
+# 骨架驗證（少序列、小 epoch）
 docker compose exec ray-head python scripts/train_traffic.py --limit 5 --epochs 2
+# 正式訓練
 docker compose exec ray-head python scripts/train_traffic.py --epochs 30
 ```
 
-單 GPU：`ScalingConfig(num_workers=1, use_gpu=True)`，兩案不能同時訓練（搶 GPU）。
-checkpoint 存 `ray_results/<案>/`，依指標保留最佳 2 份。
+- 起點權重 `yolo11n.pt`，輸入 640×640，單類 Vehicle。
+- 依序列三分，僅載入 train／val；依 `val_loss` 保留最佳 checkpoint。
 
-> traffic 單類 reshape：yolo11n.pt 是 COCO 80 類，用 `yolo11n.yaml(nc=1)` 重建、
-> 載入相容的預訓練權重（backbone/neck），偵測頭重學。
-
-**待補項目（已補上）**：
-
-| 項目 | base（Ray Train 自刻） | fine-tune（ultralytics，第 9 章） |
-|---|---|---|
-| early stopping | 仍跑固定 epochs | ✅ 內建 `patience`，自動早停 |
-| traffic 評估 mAP@0.5 | ✅ 事後用 [eval_traffic.py](scripts/eval_traffic.py) 算（第 8 章）| ✅ 訓練中內建 mAP |
-| letterbox / 大尺寸 | 640 直接 resize（變形）| ✅ imgsz 960 + letterbox |
-
-> 自刻 Ray detection loop 缺的（mAP / early-stop / letterbox），fine-tune 階段
-> 改用 **ultralytics 原生 train** 一次補齊，不重造輪子。base 的 mAP 則用獨立的
-> `eval/` 模組事後評估。
-
----
-
-## 8. eval / infer — 評估與推論
-
-程式：[eval/traffic.py](src/eval/traffic.py)、[infer/traffic.py](src/infer/traffic.py)、
-[infer/coco_vehicle.py](src/infer/coco_vehicle.py)、[scripts/eval_traffic.py](scripts/eval_traffic.py)
-
-### 8.1 eval — mAP@0.5
-
-自寫單類 mAP@0.5（VOC all-point 積分），直接吃 records + 推論結果，不需 ultralytics
-資料夾格式。補上自刻 Ray Train 缺的偵測標準指標。
+### 5.3 高公局微調（Ultralytics + Ray Tune）
 
 ```powershell
-docker compose exec ray-head python scripts/eval_traffic.py   # mAP + 畫框可視化
-```
-
-> base（UA-DETRAC 訓練）在 UA-DETRAC val：**mAP@0.5 ≈ 0.64**。近處大車準、
-> 遠處小車漏（640 直接 resize 變形 + nano 容量）——這弱點在高公局更嚴重，
-> 促成第 9 章改走自動標。
-
-### 8.2 infer — 推論
-
-| 程式 | 用途 |
-|---|---|
-| [traffic.py](src/infer/traffic.py) | 載入自刻 Ray Train 存的 `model.pt`，重建 DetectionModel + NMS → bbox（預處理須與訓練一致：640 直接 resize）|
-| [coco_vehicle.py](src/infer/coco_vehicle.py) | 官方 YOLO11 COCO 模型，car/bus/truck/機車 → Vehicle，供第 9 章自動標 |
-
----
-
-## 9. 高公局 fine-tune（知識蒸餾）
-
-**核心轉折**：base 在高公局 domain gap 太大（夜間/小目標幾乎全漏），原計畫的
-「base 預標 + 人工修」不可行。改用「**大模型自動標 → 小模型蒸餾**」，零人工。
-
-```
-COCO yolo11x（老師）── 自動標高公局白天 600 張 ──→ YOLO labels
-                                                    │ ② ultralytics fine-tune
-官方 yolo11n.pt（起點）─────────────────────────────┴─→ yolo11n（學生，上線）
-```
-
-老師（yolo11x）標完即丟，上線只用學生（yolo11n）。yolo11n 的能力透過「標籤」
-間接學自 yolo11x，訓練時不載入 yolo11x。
-
-### 程式
-
-| 程式 | 職責 |
-|---|---|
-| [coco_vehicle.py](src/infer/coco_vehicle.py) | 官方 yolo11x 自動標（COCO car/bus/truck→Vehicle）|
-| [prelabel.py](src/data/freeway/prelabel.py) | 跑自動標 → YOLO labels + preview + classes.txt（可切換 base / COCO）|
-| [roi.py](src/data/freeway/roi.py) | per-cam 偵測範圍（固定機位）|
-| [split.py](src/data/freeway/split.py) | 依 cam 分層切 train/val → ultralytics 結構 |
-| [finetune_freeway.py](scripts/finetune_freeway.py) | ultralytics train（imgsz 960 letterbox、單類、early-stop）|
-
-### 指令
-
-```powershell
-# ① COCO 自動標白天圖（6–18 時，--no-roi 標所有車）
+# (1) yolo11x 自動標註高公局白天影像（知識蒸餾的 teacher）
 docker compose exec ray-head python scripts/prelabel_freeway.py --coco --no-roi
-# ② fine-tune（蒸餾）
-docker compose exec ray-head python scripts/finetune_freeway.py --epochs 100
+
+# (2) 微調（imgsz 960、letterbox、整鏡頭隔離 test）
+docker compose exec ray-head python scripts/finetune_freeway.py --epochs 100 --test-ratio 0.1
+
+# (3) 超參搜尋（選用，ASHA）
+docker compose exec ray-head python scripts/tune_freeway.py --iterations 12 --epochs 30
 ```
 
-### 成果（200 張驗證版）
+微調採 Ultralytics 原生訓練，內建 mAP 評估、early-stopping、letterbox。`finetune_freeway.py`
+的預設超參即由 Ray Tune 搜尋所得。
 
-- 自動標品質：base 3.8 框/張 → **COCO yolo11x 11.6 框/張**（中遠景小車都抓到）
-- fine-tune yolo11n：高公局 val **mAP@0.5 ≈ 0.85 / mAP50-95 ≈ 0.72**，40 epoch 早停
-- **零人工標註**；已擴大自動標到全白天 600 張，待重訓
-
-### ROI（偵測範圍）
-
-CCTV 固定機位，可為每支 cam 定多邊形 ROI，排除遠景糊區/對向車道、界定車流計數區。
-**標註/訓練階段不套**（`--no-roi`，標所有車，人天然只標看得清的）；ROI 留到
-**推論階段**做幾何過濾。
-
-> labelImg 備註：Python 3.14 + 新 PyQt5 需手動修數處 `float→int`
-> （labelImg.py / canvas.py），且 `classes.txt` 要放在 save_dir（labels/）。
+> 單 GPU 環境下各訓練任務不可同時執行。所有 checkpoint 輸出至 `ray_results/<任務>/`。
 
 ---
 
-## 10. 現況與待辦
+## 6. 模型評估
 
-| 模組 | 狀態 |
-|---|---|
-| core | ✅ 完成 |
-| modeling | ✅ 完成（traffic / accident 模型載入）|
-| data/traffic | ✅ Ray Data pipeline（sources / pipeline，偵測）|
-| data/accident | ✅ Ray Data pipeline（sources / pipeline，分類）|
-| data/augment | ✅ 劣化增強（兩案共用）|
-| data/freeway | ✅ 抓取（1001 張獨立）+ ROI + 自動標 + 切分 |
-| train/accident | ✅ 完成，已訓練出 model（val_acc ~90%）|
-| train/traffic | ✅ base 已正式訓練（val_loss 51.95；UA-DETRAC val mAP@0.5 ≈ 0.64）|
-| eval / infer | ✅ mAP@0.5 評估 + 推論（自訓 / COCO）|
-| 高公局 fine-tune | ✅ 知識蒸餾驗證（200 張，高公局 val mAP@0.5 ≈ 0.85）；已擴大標 600 張，**待重訓** |
-| serve | ⏳ 待建（Ray Serve 即時推論 + 車禍連續確認 + ROI 過濾）|
-| tune | ⏳ 待建（Ray Tune 超參搜尋）|
+三個評估腳本各對應其 held-out test set 與模型格式：
 
-**下一步**：用全白天 600 張**重訓** fine-tune（擴大版）；之後做 `serve`
-（Ray Serve 即時推論 + 車禍連續確認 + 推論套 ROI），把兩個 model 接上高公局 CCTV。
+| 腳本 | 模型格式 | Test 來源 | 評估指標 |
+|------|----------|-----------|----------|
+| [eval_accident.py](scripts/eval_accident.py) | Ray Train checkpoint | `accident/test` | accuracy／precision／recall／F1／混淆矩陣 |
+| [eval_traffic.py](scripts/eval_traffic.py) | Ray Train checkpoint | DETRAC test 序列 | mAP@0.5（自寫 VOC all-point 積分） |
+| [eval_freeway.py](scripts/eval_freeway.py) | Ultralytics `best.pt` | `freeway_det/test` | mAP@0.5／mAP@0.5:0.95（Ultralytics 原生 val） |
+
+```powershell
+docker compose exec ray-head python scripts/eval_accident.py
+docker compose exec ray-head python scripts/eval_traffic.py
+docker compose exec ray-head python scripts/eval_freeway.py
+```
+
+評估結果見 [§9 效能總結](#9-效能總結)。
+
+---
+
+## 7. 即時監控服務
+
+### 7.1 啟動
+
+```powershell
+docker compose exec ray-head python scripts/serve_dashboard.py `
+    --poll-interval 2.0 --accident-conf-th 0.97
+# 開啟瀏覽器：http://localhost:8000/
+```
+
+| 參數 | 預設 | 說明 |
+|------|------|------|
+| `--poll-interval` | 4.0 | 每輪輪詢間隔（秒） |
+| `--conf` | 0.4 | 車輛偵測信心門檻 |
+| `--accident-conf-th` | 0.97 | 車禍報警門檻（連續 3 幀超過才報） |
+| `--no-roi` | 關 | 關閉 ROI 幾何過濾，偵測全幅車輛 |
+
+### 7.2 架構
+
+Ray Serve 以單 replica（佔 1 GPU）常駐，背景非同步迴圈對 5 支鏡頭依序執行：
+
+1. 由 MJPEG 串流抓取最新幀（[grabber.py](src/data/freeway/grabber.py)）
+2. Traffic 偵測 → 畫框、計數
+3. （選用）ROI 幾何過濾 → 計算車流數量／密度分級
+4. Accident 分類 → P(accident)，並做**連續確認**（最近 5 幀需連續 3 幀超過門檻才判定為車禍事件）
+
+結果快取為每鏡頭的標註影像與 JSON 指標。
+
+### 7.3 HTTP API
+
+| 端點 | 回應 |
+|------|------|
+| `GET /` | 監控儀表板（HTML，同源免 CORS proxy） |
+| `GET /live_focus/<cctv_id>.jpg` | 畫好框的最新標註幀（JPEG） |
+| `GET /live_focus/<cctv_id>.json` | 偵測指標 JSON |
+
+JSON 欄位：
+
+```json
+{
+  "num_detections": 7,
+  "count_level": "LOW",
+  "density_level": "LOW",
+  "is_accident": false,
+  "accident_conf": 0.86,
+  "captured_at": "2026-06-03 20:40:08"
+}
+```
+
+### 7.4 前端儀表板
+
+前端 [dashboard.html](src/serve/dashboard.html) 為 5 宮格即時監控介面，包含車流統計、
+事件日誌與車禍警報彈窗，由 Ray Serve 同源提供。
+
+> **注意**：須透過 `http://localhost:8000/` 開啟（非直接開啟 HTML 檔案），否則前端
+> 的 API 請求無法連至後端。
+
+---
+
+## 8. 專案結構
+
+```
+src/
+├── core/          叢集連線（init_ray）
+├── modeling/      YOLO11 模型載入（traffic／accident）
+├── data/
+│   ├── augment.py 劣化增強（兩案共用）
+│   ├── traffic/   UA-DETRAC → Ray Data 管線、序列切分
+│   ├── accident/  Roboflow → Ray Data 管線、分層切分
+│   └── freeway/   高公局抓取、ROI、自動標註、鏡頭切分
+├── train/
+│   ├── traffic/   Ray Train 偵測訓練
+│   └── accident/  Ray Train 分類訓練
+├── infer/         推論（traffic／accident／coco_vehicle）
+├── eval/          評估指標（mAP@0.5、分類指標）
+└── serve/         Ray Serve 即時監控（app.py + dashboard.html）
+
+scripts/           進入點：train_* / eval_* / finetune_freeway /
+                   tune_freeway / serve_dashboard / collect_freeway / prelabel_freeway
+datasets/          資料（不納入版控）
+ray_results/       訓練與微調輸出
+```
+
+---
+
+## 9. 效能總結
+
+於 held-out test set（訓練全程不可見）上的評估結果：
+
+| 模型 | Test Set | 主要指標 | 補充 |
+|------|----------|----------|------|
+| **Accident** | 62 張（圖片級） | accuracy **88.7%**／macro F1 **0.886** | accident recall 0.774、non-accident 零誤報 |
+| **Traffic** | 12 序列 1417 幀（序列級） | mAP@0.5 **82.0%** | recall 0.879 |
+| **Freeway** | 120 張 1 鏡頭（鏡頭級） | mAP@0.5 **94.1%**／mAP@0.5:0.95 **0.890** | precision 0.955、recall 0.891 |
+
+說明：
+
+- **Accident**：混淆矩陣顯示車禍 recall 偏低（31 件漏 7 件），系統不會誤報，但有漏報
+  傾向——此為乾淨 test set 才能揭露的真實表現。
+- **Traffic／Freeway**：test 指標高於部署前的 val，因 held-out test 為完全未見的序列／
+  鏡頭，能真實反映泛化能力。Freeway test 鏡頭 mAP 甚至高於訓練鏡頭 val（0.92），顯示
+  對未見鏡頭泛化良好。
+
+---
+
+## 10. 已知限制
+
+| 限制 | 說明 | 因應 |
+|------|------|------|
+| **Accident 誤報** | 分類器僅在土耳其 CCTV 車禍資料訓練，對台灣高公局正常畫面有系統性誤報（domain gap）；因高公局無車禍影片，無法 fine-tune。 | 即時服務以高報警門檻（0.97）抑制；根本解需補充台灣道路車禍正樣本。 |
+| **Freeway 標註為自動產生** | test 鏡頭 GT 由 yolo11x 自動標註，故指標反映「student 對 teacher 的逼近程度」，非對人工真值。 | 蒸餾框架下仍為有效的泛化指標；如需絕對精度應另建人工標註 test。 |
+| **單 GPU 序列推論** | 即時服務 5 鏡頭共用 1 GPU 依序推論，每鏡頭實際刷新約 3 秒。 | 如需更高頻率可改批次／多 replica 平行推論。 |
+
+---
+
+## 11. 指令速查
+
+| 階段 | 指令 |
+|------|------|
+| 啟動叢集 | `docker compose up -d ray-head` |
+| 切分 Accident | `python -m src.data.accident.split --src .../Image --out .../accident` |
+| 訓練 Accident | `python scripts/train_accident.py --epochs 50` |
+| 訓練 Traffic | `python scripts/train_traffic.py --epochs 30` |
+| 微調 Freeway | `python scripts/finetune_freeway.py --epochs 100 --test-ratio 0.1` |
+| 超參搜尋 | `python scripts/tune_freeway.py --iterations 12 --epochs 30` |
+| 評估 Accident | `python scripts/eval_accident.py` |
+| 評估 Traffic | `python scripts/eval_traffic.py` |
+| 評估 Freeway | `python scripts/eval_freeway.py` |
+| 抓取 CCTV | `python scripts/collect_freeway.py --target-per-camera 200` |
+| 自動標註 | `python scripts/prelabel_freeway.py --coco --no-roi` |
+| 即時服務 | `python scripts/serve_dashboard.py --poll-interval 2.0` |
+| 關閉叢集 | `docker compose down` |
+
+> 所有指令前綴 `docker compose exec ray-head`。
+
+---
+
+## 附錄：開發筆記
+
+本專案的設計演進、取捨理由與除錯過程記錄於 [NOTE.md](NOTE.md)。

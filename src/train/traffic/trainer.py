@@ -10,7 +10,7 @@ from ray.train import CheckpointConfig, RunConfig, ScalingConfig
 from ray.train.torch import TorchTrainer
 
 from src.data.traffic.pipeline import build_ray_dataset
-from src.data.traffic.sources import list_detrac_records
+from src.data.traffic.split import list_detrac_splits
 from src.train.traffic.worker import train_loop_per_worker
 
 
@@ -24,13 +24,16 @@ def build_trainer(epochs: int = 30,
                   experiment_name: str = "traffic") -> TorchTrainer:
     """建立車流偵測 TorchTrainer。
 
+    依序列切 train/val/test，僅載 train/val 訓練；test 完全隔離，僅供 eval。
+
     Args:
         frame_stride: 抽幀間隔（10≈1.4萬張）。
-        limit_sequences: 只用前 N 序列（先驗證用）；None=全部 100 序列。
+        limit_sequences: 只用前 N 序列（先驗證用）；None=全部標註序列。
     """
-    train_records, val_records = list_detrac_records(
+    splits = list_detrac_splits(
         detrac_root=detrac_root, frame_stride=frame_stride,
         limit_sequences=limit_sequences)
+    train_records, val_records = splits["train"], splits["val"]
 
     train_ds = build_ray_dataset(train_records, augment=True, batch_size=batch_size)
     val_ds = build_ray_dataset(val_records, augment=False, batch_size=batch_size)

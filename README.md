@@ -49,15 +49,21 @@
 ### 1.3 資料流
 
 ```
-公開資料集 ──► Ray Data 管線 ──► Ray Train ──► base 模型
-（UA-DETRAC、         （劣化增強模擬               │
-  Roboflow）           高公局低畫質）              │
-                                                   ▼
-高公局 CCTV ──► yolo11x 自動標註 ──► Ray Tune 微調 ──► Freeway 模型
-                （知識蒸餾）         （超參搜尋）         │
-                                                          ▼
-                                            Ray Serve 即時監控儀表板
+【車禍分類】
+Roboflow 車禍圖 ──► Ray Data ──► Ray Train ──► Accident base ─────────────┐
+                   （劣化增強）                （分類，不微調）            │
+                                                                          │
+【車流偵測】                                                              ▼
+UA-DETRAC ──► Ray Data ──► Ray Train ──► Traffic base ─┐          Ray Serve
+            （劣化增強）                （偵測）         │          即時監控
+                                                        ▼          儀表板
+高公局 CCTV ──► yolo11x 自動標註 ──► Ray Tune 微調 ──► Freeway 模型 ───────┘
+               （知識蒸餾 teacher）   （超參搜尋）    （Traffic base 微調版）
 ```
+
+- **Accident base**（分類）獨立訓練，因高公局無車禍影片**不微調**，直接進 Serve。
+- **Traffic base**（偵測）經高公局影像知識蒸餾微調為 **Freeway 模型**後進 Serve。
+- 兩個模型在 Serve 各司其職：Freeway 偵測車流、Accident 判斷事故。
 
 ---
 

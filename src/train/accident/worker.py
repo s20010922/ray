@@ -40,7 +40,9 @@ def train_loop_per_worker(config: dict) -> None:
     model = _reshape_head(yolo.model, len(CLASSES))
     model = ray.train.torch.prepare_model(model)   # 搬 GPU（+ DDP wrap）
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    # weight_decay 預設 0；Ray Tune 可經 config 搜尋（見 scripts/tune_accident.py）
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                                  weight_decay=config.get("weight_decay", 0.0))
 
     train_shard = ray.train.get_dataset_shard("train")
     val_shard = ray.train.get_dataset_shard("val")

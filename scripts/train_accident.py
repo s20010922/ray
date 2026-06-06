@@ -20,13 +20,18 @@ from src.train.accident.trainer import build_trainer
 def main():
     ap = argparse.ArgumentParser(description="車禍分類訓練（Ray Train）")
     ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--batch-size", type=int, default=32)
+    # 預設為 tune_accident 搜出的最佳超參（val_acc 0.790）
+    ap.add_argument("--lr", type=float, default=3.33e-4,
+                    help="Ray Tune 最佳值；lr≥1e-3 會讓加入合成台灣資料後崩潰")
+    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--weight-decay", type=float, default=3.8e-4,
+                    help="Ray Tune 最佳值")
     args = ap.parse_args()
 
     init_ray()
     trainer = build_trainer(epochs=args.epochs, lr=args.lr,
-                            batch_size=args.batch_size)
+                            batch_size=args.batch_size,
+                            weight_decay=args.weight_decay)
     result = trainer.fit()
 
     print("=== 訓練完成 ===")

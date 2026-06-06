@@ -14,12 +14,45 @@
 """
 
 import argparse
+import os
+import signal
 import time
 
 from ray import serve
 
 from src.core.cluster import init_ray
 from src.serve.app import TrafficMonitor
+
+
+def _kill_stale_serve_drivers():
+    """清掉前次 session 殘留的 serve_dashboard driver。
+
+    serve_dashboard.py 末尾有 while-sleep 迴圈常駐，`serve shutdown` 只會移除
+    Ray Serve 部署、不會殺掉這些 driver 行程。殘留多個 driver 會互搶 serve.run
+    導致新 serve 起不來。啟動時先掃 /proc 殺掉其它同名行程（排除自己與父行程）。
+    """
+    me, parent = os.getpid(), os.getppid()
+    killed = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        p = int(pid)
+        if p in (me, parent):
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        except OSError:
+            continue
+        if "serve_dashboard.py" in cmd:
+            try:
+                os.kill(p, signal.SIGKILL)
+                killed.append(p)
+            except OSError:
+                pass
+    if killed:
+        print(f"[serve] 清掉殘留 driver：{killed}")
+        time.sleep(2)
 
 
 def main():
@@ -32,7 +65,11 @@ def main():
     ap.add_argument("--poll-interval", type=float, default=4.0)
     ap.add_argument("--conf", type=float, default=0.4, help="偵測信心門檻")
     ap.add_argument("--accident-conf-th", type=float, default=0.97,
-                    help="車禍報警門檻（拉高治 domain-gap 誤報；連續 3 幀超過才報）")
+                    help="整幅分類器輔助門檻（domain-gap 不可靠，僅報告用）")
+    ap.add_argument("--stall-frames", type=int, default=3,
+                    help="車道內車輛連續靜止幾幀視為事故（poll 2s 時 3≈6 秒）")
+    ap.add_argument("--move-frac", type=float, default=0.15,
+                    help="中心位移 < move-frac × box 對角線 → 判定未移動")
     ap.add_argument("--imgsz", type=int, default=960)
     ap.add_argument("--no-roi", action="store_true", help="關閉 ROI 幾何過濾")
     ap.add_argument("--clip-dir",
@@ -43,7 +80,12 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
+    _kill_stale_serve_drivers()          # 先清殘留 driver，避免互搶
     init_ray()
+    try:
+        serve.shutdown()                 # 清掉任何既有部署，確保乾淨重啟
+    except Exception:
+        pass
     serve.start(http_options={"host": "0.0.0.0", "port": args.port})
 
     gpus = 0 if args.no_gpu else 1
@@ -58,6 +100,8 @@ def main():
         imgsz=args.imgsz,
         use_roi=not args.no_roi,
         accident_conf_th=args.accident_conf_th,
+        stall_frames=args.stall_frames,
+        move_frac=args.move_frac,
         clip_dir=args.clip_dir,
         device=device,
     )

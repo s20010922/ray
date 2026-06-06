@@ -12,15 +12,17 @@ UI 契約（每鏡頭、每 pollMs 輪詢一次）：
       Accident 分類 = Ray Train checkpoint（model.pt）
   - 背景 asyncio 迴圈：對 5 支鏡頭輪流 grab_jpeg_frame → 推論 → 更新快取。
     抓幀/推論是阻塞操作，丟到 thread executor 跑，不卡事件迴圈。
-  - 車禍「連續確認」：單幀易誤判，需連續 N 幀都判 accident 且高信心才算事件。
+  - 車禍判斷（方案 A）：整幅分類在高公局 domain gap 太大、無鑑別力，故改以
+    「建在偵測器上的物理徵兆」為主判斷——車道內出現持續靜止的車輛（拋錨/事故
+    的強信號），由 tracker.py 的輕量 IOU 追蹤器偵測。整幅分類器降為輔助信號。
   - ROI：推論階段幾何過濾（只算主車道區的車），對齊 roi.py。
 """
 
 import asyncio
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
-from typing import Deque, Dict
+from typing import Dict
 
 import cv2
 import numpy as np
@@ -31,16 +33,17 @@ from ray import serve
 from src.data.freeway.grabber import FOCUS_CAMERAS, grab_jpeg_frame
 from src.data.freeway.roi import draw_roi, filter_by_roi, get_roi
 from src.infer.accident import classify, load_classifier
+from src.infer.tracker import VehicleTracker
 from src.modeling.accident import CLASSES as ACC_CLASSES
 
 # 車流分級門檻（依 ROI 內車輛數 / 佔用面積比；目測初版，可再校）
 _COUNT_BANDS = [(8, "LOW"), (20, "MED"), (10**9, "HIGH")]
 _DENSITY_BANDS = [(0.10, "LOW"), (0.25, "MED"), (1.01, "HIGH")]
 
-# 車禍連續確認：最近 _ACC_WINDOW 幀中需連續 _ACC_CONSEC 幀 accident 且 conf≥門檻
-# 門檻預設拉高（治 Accident domain-gap 誤報；門檻可由啟動參數覆寫）。
-_ACC_WINDOW = 5
-_ACC_CONSEC = 3
+# 靜止車輛事故判斷：連續 _STALL_FRAMES 幀靜止即視為徵兆（poll 2s 時 3≈6 秒）。
+# 整幅分類器門檻保留為「輔助信號」報告用，不再主導判斷（domain-gap 不可靠）。
+_STALL_FRAMES_DEFAULT = 3
+_STALL_MOVE_FRAC = 0.15
 _ACC_CONF_TH_DEFAULT = 0.97
 
 app = FastAPI()
@@ -65,6 +68,8 @@ class TrafficMonitor:
                  imgsz: int = 960,
                  use_roi: bool = True,
                  accident_conf_th: float = _ACC_CONF_TH_DEFAULT,
+                 stall_frames: int = _STALL_FRAMES_DEFAULT,
+                 move_frac: float = _STALL_MOVE_FRAC,
                  clip_dir: str =
                  "/workspace/datasets/accident/video/accident",
                  device: str = "cuda"):
@@ -76,7 +81,9 @@ class TrafficMonitor:
         self.conf = conf
         self.imgsz = imgsz
         self.use_roi = use_roi
-        self.accident_conf_th = accident_conf_th
+        self.accident_conf_th = accident_conf_th   # 分類器輔助門檻（僅報告用）
+        self.stall_frames = stall_frames
+        self.move_frac = move_frac
         self.clip_dir = Path(clip_dir)
         self.device = device   # cuda；demo 監控訓練時用 cpu 釋出 GPU
 
@@ -93,9 +100,10 @@ class TrafficMonitor:
 
         # 每鏡頭快取：最新標註 jpg bytes + json dict
         self.cache: Dict[str, dict] = {}
-        # 每鏡頭最近幾幀的 accident 判定（連續確認用）
-        self.acc_hist: Dict[str, Deque] = defaultdict(
-            lambda: deque(maxlen=_ACC_WINDOW))
+        # 每鏡頭一個 IOU 追蹤器（偵測車道內靜止車輛 → 事故徵兆）
+        self.trackers: Dict[str, VehicleTracker] = defaultdict(
+            lambda: VehicleTracker(move_frac=self.move_frac,
+                                   stall_frames=self.stall_frames))
 
         self._dashboard = (Path(__file__).parent / "dashboard.html").read_text(
             encoding="utf-8")
@@ -125,25 +133,29 @@ class TrafficMonitor:
         area = sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in boxes)
         density = float(area / (w * h)) if (w * h) else 0.0
 
-        # Accident 分類（整幅）→ P(accident)
+        # 主判斷：車道內靜止車輛（建在偵測器上的事故/拋錨徵兆，不需車禍正樣本）
+        stalled = self.trackers[cam_id].update(boxes)
+        is_acc = len(stalled) > 0
+
+        # 輔助信號：整幅分類器 P(accident)（domain-gap 不可靠，僅報告、不主導）
         pred, conf = classify(self.classifier, img, self.acc_device)
         acc_prob = conf if ACC_CLASSES[pred] == "accident" else 1.0 - conf
 
-        # 連續確認（門檻可調，治 domain-gap 誤報）
-        self.acc_hist[cam_id].append(acc_prob >= self.accident_conf_th)
-        hist = list(self.acc_hist[cam_id])
-        is_acc = (len(hist) >= _ACC_CONSEC and all(hist[-_ACC_CONSEC:]))
-
-        # 畫框（+ ROI 邊界）
+        # 畫框（+ ROI 邊界）；靜止車輛標紅
         vis = img.copy()
         for (x1, y1, x2, y2), s in zip(boxes.astype(int), scores):
             cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 136), 2)
+        for tr in stalled:
+            x1, y1, x2, y2 = tr.box.astype(int)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.putText(vis, f"STALLED x{tr.stationary}", (x1, max(12, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         if roi is not None:
             vis = draw_roi(vis, roi)
         cv2.putText(vis, f"vehicles: {n}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
         if is_acc:
-            cv2.putText(vis, f"ACCIDENT p={acc_prob:.2f}", (10, 70),
+            cv2.putText(vis, f"ACCIDENT: {len(stalled)} stalled", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 32, 255), 2)
         ok, enc = cv2.imencode(".jpg", vis)
         jpg = enc.tobytes() if ok else b""
@@ -155,7 +167,8 @@ class TrafficMonitor:
                 "count_level": _level(n, _COUNT_BANDS),
                 "density_level": _level(density, _DENSITY_BANDS),
                 "is_accident": bool(is_acc),
-                "accident_conf": round(float(acc_prob), 4),
+                "stalled_vehicles": len(stalled),
+                "accident_conf": round(float(acc_prob), 4),   # 分類器輔助信號
                 "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         }
@@ -246,7 +259,7 @@ class TrafficMonitor:
             return JSONResponse({"error": f"無法開啟 {name}"}, status_code=500)
         self.inject_cap[cam_id] = cap
         self.inject_clip[cam_id] = name
-        self.acc_hist[cam_id].clear()        # 重置連續確認
+        self.trackers.pop(cam_id, None)      # 重置追蹤狀態（避免跨來源誤判）
         return JSONResponse({"status": "injecting", "cam": cam_id, "clip": name})
 
     @app.post("/inject/{cam_id}/clear")
@@ -256,7 +269,7 @@ class TrafficMonitor:
         if cap is not None:
             cap.release()
         self.inject_clip.pop(cam_id, None)
-        self.acc_hist[cam_id].clear()
+        self.trackers.pop(cam_id, None)
         return JSONResponse({"status": "cleared", "cam": cam_id})
 
 

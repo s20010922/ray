@@ -19,6 +19,7 @@ from src.train.accident.worker import train_loop_per_worker
 def build_trainer(epochs: int = 20,
                   lr: float = 1e-3,
                   batch_size: int = 32,
+                  weight_decay: float = 0.0,
                   data_root: str = "/workspace/datasets/accident",
                   storage_path: str = "/workspace/ray_results",
                   experiment_name: str = "accident") -> TorchTrainer:
@@ -36,7 +37,8 @@ def build_trainer(epochs: int = 20,
 
     return TorchTrainer(
         train_loop_per_worker=train_loop_per_worker,
-        train_loop_config={"epochs": epochs, "lr": lr, "batch_size": batch_size},
+        train_loop_config={"epochs": epochs, "lr": lr, "batch_size": batch_size,
+                           "weight_decay": weight_decay},
         scaling_config=ScalingConfig(num_workers=1, use_gpu=True),
         datasets={"train": train_ds, "val": val_ds},
         run_config=RunConfig(

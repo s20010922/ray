@@ -41,17 +41,18 @@ def load_classifier(checkpoint_path: str,
 
 def find_best_accident_checkpoint(results_root: str = "/workspace/ray_results",
                                   experiment: str = "accident") -> str:
-    """自動找 val_acc 最高的 checkpoint。
+    """自動找最新一次訓練的 checkpoint（依檔案修改時間）。
 
-    Ray Train 依 val_acc 命名 checkpoint 資料夾（checkpoint_000NNN），
-    最後一個數字最大的通常是最佳（搭配 CheckpointConfig num_to_keep=2）。
+    注意：不可用字串排序——Ray Train 的 run 目錄帶 UUID 前綴
+    （TorchTrainer_<uuid>_...），字串排序會被前綴打亂而選到舊 run。
+    改用 os.path.getmtime 取最新寫入的 model.pt，跨 run 穩定。
     """
     pattern = os.path.join(results_root, experiment, "**/model.pt")
-    candidates = sorted(glob.glob(pattern, recursive=True))
+    candidates = glob.glob(pattern, recursive=True)
     if not candidates:
         raise FileNotFoundError(
             f"找不到 accident checkpoint，搜尋路徑：{pattern}")
-    return candidates[-1]
+    return max(candidates, key=os.path.getmtime)
 
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32).reshape(3, 1, 1)

@@ -20,7 +20,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.core.cluster import init_ray
-from src.monitor.state import cluster_state, components_state
+from src.monitor.state import cluster_state, components_state, pipeline_state
 
 app = FastAPI()
 _HTML = (Path(__file__).resolve().parent.parent
@@ -41,6 +41,11 @@ def cluster():
 @app.get("/components.json")
 def components():
     return JSONResponse(components_state(), headers=_NOCACHE)
+
+
+@app.get("/pipeline.json")
+def pipeline():
+    return JSONResponse(pipeline_state(), headers=_NOCACHE)
 
 
 def main():

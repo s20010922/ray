@@ -15,76 +15,119 @@
 }
 html,body{height:100%}
 body{background:
-   radial-gradient(1200px 600px at 80% -10%,rgba(34,211,255,.06),transparent),
+   radial-gradient(1400px 700px at 80% -10%,rgba(34,211,255,.06),transparent),
    var(--bg);
   color:var(--tp);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
-  font-size:15px;line-height:1.5;display:flex;flex-direction:column;min-height:100vh}
+  font-size:15px;line-height:1.5;display:flex;flex-direction:column;height:100vh;overflow:hidden}
 header{display:flex;align-items:center;justify-content:space-between;
-  padding:16px 28px;border-bottom:1px solid var(--line);
+  padding:14px 28px;border-bottom:1px solid var(--line);
   background:linear-gradient(180deg,#0b1322,#070b12);flex-shrink:0}
-.htitle{font-size:19px;font-weight:800;letter-spacing:4px;color:var(--nb);
+.htitle{font-size:20px;font-weight:800;letter-spacing:4px;color:var(--nb);
   text-shadow:0 0 16px rgba(34,211,255,.55)}
-.hsub{font-size:11.5px;color:var(--ts);letter-spacing:1.5px;margin-top:4px}
-.hclock{font-family:var(--mono);font-size:18px;color:var(--nb);letter-spacing:2px;font-weight:600}
-.wrap{flex:1;display:grid;grid-template-columns:380px 1fr;gap:18px;
-  padding:18px 24px;align-items:stretch;max-width:1500px;width:100%;margin:0 auto}
+.hsub{font-size:12px;color:var(--ts);letter-spacing:1.5px;margin-top:4px}
+.hclock{font-family:var(--mono);font-size:19px;color:var(--nb);letter-spacing:2px;font-weight:600}
+
+/* 三欄滿版：節點 | Ray 元件 | Pipeline */
+.wrap{flex:1;display:grid;grid-template-columns:420px minmax(0,1fr) 320px;gap:16px;
+  padding:16px 20px;align-items:stretch;width:100%;min-height:0}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:20px 22px;display:flex;flex-direction:column;
-  box-shadow:0 4px 24px rgba(0,0,0,.3),inset 0 0 30px rgba(0,0,0,.25)}
-.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-.pt{font-size:14px;font-weight:800;letter-spacing:2px;color:var(--ng);text-transform:uppercase}
-.pt .zh{display:block;color:var(--ts);font-weight:500;letter-spacing:1px;font-size:11px;margin-top:3px}
-.dot{width:9px;height:9px;border-radius:50%;background:#2a3a52;display:inline-block}
+  padding:18px 20px;display:flex;flex-direction:column;min-height:0;
+  box-shadow:0 4px 24px rgba(0,0,0,.3),inset 0 0 30px rgba(0,0,0,.25);overflow-y:auto}
+/* 左欄不顯示捲軸（內容已壓緊，溢出時仍可滾輪捲動） */
+.panel.noscroll{scrollbar-width:none}
+.panel.noscroll::-webkit-scrollbar{display:none}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-shrink:0}
+.pt{font-size:15px;font-weight:800;letter-spacing:2px;color:var(--ng);text-transform:uppercase}
+.pt .zh{display:block;color:var(--ts);font-weight:500;letter-spacing:1px;font-size:11.5px;margin-top:3px}
+.dot{width:10px;height:10px;border-radius:50%;background:#2a3a52;display:inline-block}
 .dot.ok{background:var(--ng);box-shadow:0 0 10px var(--ng);animation:p 1.3s infinite}
 .dot.warn{background:var(--nr);box-shadow:0 0 10px var(--nr)}
 .dot.idle{background:#3a4d68}
 @keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
-.big{font-size:46px;font-weight:800;color:var(--nb);font-family:var(--mono);line-height:1;
+
+/* ── 左欄：叢集節點（放大但壓緊高度，免捲軸）── */
+.big{font-size:44px;font-weight:800;color:var(--nb);font-family:var(--mono);line-height:1;
   text-shadow:0 0 20px rgba(34,211,255,.4)}
-.big small{font-size:14px;color:var(--ts);font-weight:500;margin-left:6px}
-.rlabel{display:flex;justify-content:space-between;font-size:12.5px;
-  font-family:var(--mono);color:var(--ts);margin-top:14px;margin-bottom:6px}
+.big small{font-size:14px;color:var(--ts);font-weight:500;margin-left:8px}
+.rlabel{display:flex;justify-content:space-between;font-size:13.5px;
+  font-family:var(--mono);color:var(--ts);margin-top:11px;margin-bottom:5px}
 .rlabel b{color:var(--tp)}
 .bar{height:9px;background:#0a111f;border-radius:5px;overflow:hidden;border:1px solid rgba(34,211,255,.1)}
 .bar>div{height:100%;background:linear-gradient(90deg,var(--nb),var(--ng));
   transition:width .5s;box-shadow:0 0 10px rgba(45,255,160,.4)}
-.nodes{display:flex;flex-direction:column;gap:11px;margin-top:18px}
-.node{display:flex;flex-direction:column;gap:8px;padding:13px 15px;
-  background:var(--card2);border:1px solid var(--line);border-radius:10px;transition:.3s}
+.nodes{display:flex;flex-direction:column;gap:11px;margin-top:16px}
+.node{display:flex;flex-direction:column;gap:8px;padding:13px 16px;
+  background:var(--card2);border:1px solid var(--line);border-radius:11px;transition:.3s}
 .node.busy{border-color:rgba(45,255,160,.4);background:var(--card3)}
 .node .ntop{display:flex;align-items:center;gap:10px}
-.node .role{font-size:10.5px;font-weight:800;letter-spacing:1px;padding:4px 10px;border-radius:5px;white-space:nowrap}
+.node .role{font-size:12.5px;font-weight:800;letter-spacing:1px;padding:4px 11px;border-radius:6px;white-space:nowrap}
 .role.Head{color:var(--no);background:rgba(255,160,51,.1);border:1px solid rgba(255,160,51,.45)}
 .role.Worker{color:var(--np);background:rgba(192,139,255,.1);border:1px solid rgba(192,139,255,.45)}
-.node .nname{font-size:14px;font-weight:700;color:var(--tp)}
-.node .tasks{font-family:var(--mono);font-size:12px;font-weight:700;padding:3px 9px;border-radius:5px;
-  color:var(--tm);border:1px solid var(--line)}
+.node .nname{font-size:17px;font-weight:700;color:var(--tp);white-space:nowrap}
+.node .tasks{font-family:var(--mono);font-size:14px;font-weight:700;padding:4px 11px;border-radius:6px;
+  color:var(--tm);border:1px solid var(--line);white-space:nowrap}
 .node .tasks.on{color:#062;background:var(--ng);box-shadow:0 0 10px rgba(45,255,160,.5)}
-.node .nip{font-family:var(--mono);font-size:11px;color:var(--tm);margin-left:auto}
-.node .res{font-family:var(--mono);font-size:12px;color:var(--ts);letter-spacing:.2px}
+.node .nip{font-family:var(--mono);font-size:13px;color:var(--tm);margin-left:auto;white-space:nowrap}
+.node .res{font-family:var(--mono);font-size:14px;color:var(--ts);letter-spacing:.2px;white-space:nowrap}
 .node .res b{color:var(--ng);font-weight:700}
-.node .load{display:flex;align-items:center;gap:9px;margin-top:6px}
-.node .llabel{font-family:var(--mono);font-size:11px;color:var(--tm);width:34px;flex-shrink:0}
-.node .lbar{flex:1;height:7px;background:#0a111f;border-radius:4px;overflow:hidden;border:1px solid rgba(34,211,255,.1)}
+.node .load{display:flex;align-items:center;gap:10px;margin-top:5px}
+.node .llabel{font-family:var(--mono);font-size:13px;color:var(--tm);width:40px;flex-shrink:0}
+.node .lbar{flex:1;height:8px;background:#0a111f;border-radius:5px;overflow:hidden;border:1px solid rgba(34,211,255,.1)}
 .node .lbar>div{height:100%;transition:width .5s}
-.node .ltxt{font-family:var(--mono);font-size:11.5px;color:var(--ts);white-space:nowrap;width:48px;text-align:right}
+.node .ltxt{font-family:var(--mono);font-size:14px;color:var(--ts);white-space:nowrap;width:60px;text-align:right}
 .node .ltxt b{color:var(--tp);font-weight:700}
 .lvl-lo>div{background:linear-gradient(90deg,#1c6,var(--ng))}
 .lvl-mid>div{background:linear-gradient(90deg,var(--no),#fc4)}
 .lvl-hi>div{background:linear-gradient(90deg,#c33,var(--nr))}
-.comp{flex:1;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:1fr;gap:16px}
+
+/* ── 中欄：Ray 元件（2×2，滾動 log）── */
+.comp{flex:1;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:1fr;gap:14px;min-height:0}
 .citem{background:var(--card2);border:1px solid var(--line);border-radius:12px;
-  padding:20px 22px;display:flex;flex-direction:column;transition:.3s}
+  padding:16px 18px;display:flex;flex-direction:column;min-height:0;transition:.3s}
 .citem.on{border-color:rgba(45,255,160,.5);background:var(--card3);box-shadow:0 0 24px rgba(45,255,160,.1)}
-.crow{display:flex;align-items:center;justify-content:space-between}
+.crow{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .cname{font-size:20px;font-weight:800;color:var(--nb);letter-spacing:.5px}
 .cstate{font-size:10.5px;font-weight:800;letter-spacing:1.5px;padding:5px 11px;border-radius:6px}
 .cstate.act{color:#062;background:var(--ng);box-shadow:0 0 12px rgba(45,255,160,.5)}
 .cstate.idle{color:var(--tm);border:1px solid var(--line)}
-.cdoing{font-size:15px;color:var(--tp);margin-top:18px;font-weight:600;
-  display:flex;align-items:center;gap:10px;min-height:24px}
-.cdesc{font-size:12.5px;color:var(--ts);margin-top:auto;padding-top:16px;line-height:1.6;
+.cdoing{font-size:14.5px;color:var(--tp);margin-top:14px;font-weight:600;flex-shrink:0;
+  display:flex;align-items:center;gap:10px;min-height:22px}
+.clog{flex:1;margin-top:12px;min-height:90px;background:#080e1a;
+  border:1px solid rgba(34,211,255,.1);border-radius:8px;padding:9px 11px;
+  font-family:var(--mono);font-size:12px;line-height:1.7;overflow-y:auto;
+  display:flex;flex-direction:column;gap:1px}
+.clog::-webkit-scrollbar{width:7px}
+.clog::-webkit-scrollbar-thumb{background:rgba(34,211,255,.25);border-radius:4px}
+.clog .llbl{font-size:9.5px;letter-spacing:1.5px;color:var(--tm);margin-bottom:4px;
+  text-transform:uppercase;position:sticky;top:0;background:#080e1a;padding-bottom:2px;flex-shrink:0}
+.clog .ll{color:var(--ts);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
+.clog .ll:last-child{color:var(--ng)}
+.clog .empty{color:var(--tm);font-style:italic;font-size:11px}
+.cdesc{font-size:12px;color:var(--ts);margin-top:12px;padding-top:12px;line-height:1.55;flex-shrink:0;
   border-top:1px solid rgba(34,211,255,.1)}
+
+/* ── 右欄：Pipeline 流程（直式步驟）── */
+.pipe{display:flex;flex-direction:column;gap:0}
+.pstep{display:flex;align-items:flex-start;gap:13px;padding:9px 2px 16px;position:relative}
+.pstep:not(.last)::before{content:'';position:absolute;left:17px;top:38px;bottom:2px;
+  width:2px;background:var(--line)}
+.pstep.done:not(.last)::before{background:rgba(45,255,160,.45)}
+.pnum{width:36px;height:36px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;font-family:var(--mono);font-size:15px;font-weight:800;
+  border:1px solid var(--line);color:var(--tm);background:#0a111f;position:relative;z-index:1;transition:.3s}
+.pstep.done .pnum{color:#052012;background:var(--ng);border-color:var(--ng)}
+.pstep.cur .pnum{color:#052012;background:var(--ng);border-color:var(--ng);
+  box-shadow:0 0 16px rgba(45,255,160,.7);animation:p 1.3s infinite}
+.ptxt{padding-top:8px}
+.pmain{font-size:15px;font-weight:700;color:var(--tm);transition:.3s}
+.pstep.done .pmain{color:var(--ng)}
+.pstep.cur .pmain{color:var(--tp)}
+.psub{font-size:11px;color:var(--tm);font-family:var(--mono);margin-top:2px}
+.pstep.cur .psub{color:var(--ng)}
+.finish{margin-top:16px;padding:16px;border-radius:11px;text-align:center;font-weight:800;
+  color:#052012;background:var(--ng);box-shadow:0 0 26px rgba(45,255,160,.55);
+  font-size:16px;letter-spacing:1px;animation:p 1.6s infinite}
+.finish small{display:block;font-size:11px;font-weight:600;color:#0a3a22;margin-top:4px;letter-spacing:.5px}
 </style>
 </head>
 <body>
@@ -97,7 +140,8 @@ header{display:flex;align-items:center;justify-content:space-between;
 </header>
 
 <div class="wrap">
-  <div class="panel">
+  <!-- 左：叢集節點 -->
+  <div class="panel noscroll">
     <div class="ph">
       <div class="pt">Cluster Nodes<span class="zh">叢集節點</span></div>
       <span class="dot" id="cdot"></span>
@@ -112,6 +156,7 @@ header{display:flex;align-items:center;justify-content:space-between;
     <div class="nodes" id="nodeList"></div>
   </div>
 
+  <!-- 中：Ray 元件 -->
   <div class="panel">
     <div class="ph">
       <div class="pt">Ray Components<span class="zh">技術堆疊 · 即時活動</span></div>
@@ -120,23 +165,37 @@ header{display:flex;align-items:center;justify-content:space-between;
     <div class="comp">
       <div class="citem" id="c-data"><div class="crow"><div class="cname">Ray Data</div><div class="cstate idle" id="s-data">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-data"></span><span id="doing-data">–</span></div>
+        <div class="clog" id="log-data"><div class="empty">—</div></div>
         <div class="cdesc" id="desc-data">串流資料管線</div></div>
       <div class="citem" id="c-train"><div class="crow"><div class="cname">Ray Train</div><div class="cstate idle" id="s-train">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-train"></span><span id="doing-train">–</span></div>
+        <div class="clog" id="log-train"><div class="empty">—</div></div>
         <div class="cdesc" id="desc-train">分散式訓練</div></div>
       <div class="citem" id="c-tune"><div class="crow"><div class="cname">Ray Tune</div><div class="cstate idle" id="s-tune">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-tune"></span><span id="doing-tune">–</span></div>
+        <div class="clog" id="log-tune"><div class="empty">—</div></div>
         <div class="cdesc" id="desc-tune">超參搜尋</div></div>
       <div class="citem" id="c-serve"><div class="crow"><div class="cname">Ray Serve</div><div class="cstate idle" id="s-serve">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-serve"></span><span id="doing-serve">–</span></div>
+        <div class="clog" id="log-serve"><div class="empty">—</div></div>
         <div class="cdesc" id="desc-serve">即時推論服務</div></div>
     </div>
+  </div>
+
+  <!-- 右：Pipeline 流程 -->
+  <div class="panel">
+    <div class="ph">
+      <div class="pt">Pipeline<span class="zh">流程 · 目前階段</span></div>
+      <span class="dot" id="pdot"></span>
+    </div>
+    <div class="pipe" id="pipe"></div>
   </div>
 </div>
 
 <script>
 function clock(){document.getElementById('clk').textContent=new Date().toLocaleTimeString('zh-TW',{hour12:false});}
 setInterval(clock,1000); clock();
+const esc=s=>String(s).replace(/[<>&]/g,'');
 
 const lvl=p=>p>=80?'lvl-hi':p>=40?'lvl-mid':'lvl-lo';
 const loadRow=(label,pct,txt)=>
@@ -182,6 +241,14 @@ function setComp(key,c){
   document.getElementById('d-'+key).className='dot '+(c.active?'ok':'idle');
   document.getElementById('doing-'+key).textContent=c.doing;
   if(typeof c.detail==='string') document.getElementById('desc-'+key).textContent=c.detail;
+  const lg=document.getElementById('log-'+key);
+  const lines=(c.log||[]);
+  // 有新 log 才更新；沒有就保留上次（不消失），並自動捲到最新
+  if(lg && lines.length){
+    lg.innerHTML='<div class="llbl">recent log</div>'+
+      lines.map(l=>'<div class="ll">'+esc(l)+'</div>').join('');
+    lg.scrollTop=lg.scrollHeight;
+  }
 }
 async function pollComponents(){
   try{
@@ -191,9 +258,34 @@ async function pollComponents(){
     ['data','train','tune','serve'].forEach(k=>setComp(k,d[k]));
   }catch(e){}
 }
-pollCluster(); pollComponents();
+
+async function pollPipeline(){
+  try{
+    const r=await fetch('/pipeline.json?_='+Date.now(),{signal:AbortSignal.timeout(6000)});
+    if(!r.ok) throw 0;
+    const d=await r.json();
+    const done=new Set(d.done||[]), cur=d.current, last=d.stages.length-1;
+    document.getElementById('pdot').className='dot '+(d.status==='done'?'ok':(cur?'ok':'idle'));
+    let html=d.stages.map((s,i)=>{
+      const state=done.has(s.id)?'done':(s.id===cur?'cur':'todo');
+      const isLast=i===last;
+      const sub=done.has(s.id)?'完成':(s.id===cur?'進行中…':'待處理');
+      return '<div class="pstep '+state+(isLast?' last':'')+'">'+
+        '<div class="pnum">'+(done.has(s.id)?'✓':(i+1))+'</div>'+
+        '<div class="ptxt"><div class="pmain">'+esc(s.label)+'</div>'+
+        '<div class="psub">'+sub+'</div></div></div>';
+    }).join('');
+    if(d.status==='done'){
+      html+='<div class="finish">✓ FINISH<small>全流程完成 · Serve 已上線</small></div>';
+    }
+    document.getElementById('pipe').innerHTML=html;
+  }catch(e){}
+}
+
+pollCluster(); pollComponents(); pollPipeline();
 setInterval(pollCluster,2000);
 setInterval(pollComponents,2000);
+setInterval(pollPipeline,2000);
 </script>
 </body>
 </html>

@@ -449,7 +449,8 @@ docker compose exec ray-head python scripts/serve_dashboard.py
         │  背景 asyncio 迴圈，每 2s 輪詢每鏡頭（demo 值，預設 4s）：  │
         │   ① Traffic 偵測（freeway best.pt, ultralytics）→ 畫框、數車 │
         │   ② ROI 幾何過濾（roi.py，只算主車道）→ count/density level │
-        │   ③ Accident 分類（Ray Train ckpt）→ P(accident) + 連續確認 │
+        │   ③ 靜止車輛偵測（tracker.py，主判斷）→ is_accident         │
+        │   ④ Accident 分類（Ray Train ckpt）→ P(accident)（輔助信號） │
         │  快取每鏡頭：標註 jpg + json                               │
         └───────────────────────────────────────────────────────────┘
                                         ▼
@@ -472,18 +473,18 @@ UI 每 2s 對每鏡頭抓 `.jpg`（標註幀）+ `.json`（指標），契約對
 |---|---|
 | 兩 model 格式不同 | Traffic 用 ultralytics `YOLO(best.pt)`；Accident 用 `infer/accident` 重建 Ray Train ckpt |
 | 抓幀/推論阻塞 | 丟 thread executor 跑，不卡 asyncio 事件迴圈 |
-| 車禍連續確認 | 最近 5 幀需連續 3 幀 `P(accident)≥門檻`（`--accident-conf-th`，預設 0.97）才報（單幀易誤判）|
-| ROI 過濾 | 推論階段套 [roi.py](src/data/freeway/roi.py) 多邊形，只算主車道車輛 |
+| **車禍判斷（主）靜止車輛偵測** | [tracker.py](src/infer/tracker.py) 輕量 IOU 追蹤器：停在車道的車持續高 IOU 匹配、位移趨零，連續靜止達 `--stall-frames`（預設 3）即報。**不需車禍正樣本**，標紅 STALLED |
+| 分類器為輔助 | 整幅 `P(accident)` 寫進 json 但不主導；`--accident-conf-th` 僅報告用 |
+| 啟動清殘留 | serve 啟動時掃 /proc 殺掉舊 serve driver（避免互搶 serve.run）|
 | count/density level | 車輛數 / ROI 內車框面積佔比 → LOW/MED/HIGH |
 
-> ⚠️ **已知限制（Accident 誤報）**：Accident 分類器只在土耳其 CCTV 車禍資料訓練，
-> 沒看過台灣高公局，又因高公局**無車禍影片無法 fine-tune**，實測對正常高公局畫面
-> 會穩定誤判為 accident（domain gap）。連續確認擋不住系統性誤判。Traffic 偵測這側
-> 因走了知識蒸餾微調（第 9 章）所以正常。這是 Accident 案的根本資料缺口，非 serve bug。
+> **為何改靜止偵測為主**：整幅分類在高公局「畫面 + 一台小事故車」訊號太局部，whole-frame
+> 吃不到（實測 lr=1e-3 直接崩潰、最佳超參台灣域 A-B 也僅 +0.11）。事故的物理徵兆「車停在
+> 車道」可建在已驗證的偵測器上、零正樣本，故當主判斷。
 >
-> 用真實車禍片段注入（`/inject/<cam>`）驗證更發現：車禍片段的 `accident_conf`
-> （0.46~0.88）與正常畫面（~0.88）重疊，代表模型**無鑑別力**。即時服務以高門檻
-> （`--accident-conf-th 0.97`）抑制誤報，但等同也偵測不到真車禍。
+> **分類器仍補強**：用**合成台灣車禍**（真車貼真高公局幀，第 9 章延伸）+ Ray Tune 最佳超參
+> 重訓後，真車禍片段 P(accident) 0.50 vs 正常 0.20（**C-B +0.295**，舊模型為負）。注入驗證
+> 證實兩機制互補——靜止偵測抓到分類器漏掉的事故（`is_accident=True`）。
 
 ### 10B. monitor — RAY MONITOR 叢集監控
 
@@ -521,28 +522,29 @@ docker compose exec -d ray-head python scripts/monitor.py   # http://localhost:8
 | data/augment | ✅ 劣化增強（兩案共用）|
 | data/freeway | ✅ 抓取（1001 張獨立）+ ROI + 自動標 + 切分 |
 | held-out test 切分 | ✅ 三案皆有隔離 test（圖片/序列/鏡頭級，見 8.0）|
-| train/accident | ✅ 從平衡 `Image/` 重訓（隔離 test）；**test_acc = 88.7% / macro F1 0.886** |
-| train/traffic | ✅ base 依序列三分重訓（隔離 test）；**DETRAC test mAP@0.5 = 82.0%** |
-| eval / infer | ✅ 三個 eval 腳本（accident / traffic-DETRAC / freeway，見 8.1）|
+| data/accident 合成 | ✅ 合成台灣車禍（[synth.py](src/data/accident/synth.py)，真車貼真幀）併入 train |
+| train/accident | ✅ 合成資料 + **Ray Tune 最佳超參**重訓；土耳其 test acc 83.9%、**台灣域 C-B +0.295** |
+| train/traffic | ✅ base 依序列三分重訓（隔離 test）；**DETRAC test mAP@0.5 = 82.6%** |
+| eval / infer | ✅ 三個 eval 腳本 + [diag_accident_synth.py](scripts/diag_accident_synth.py)（台灣域分離度）|
 | 高公局 fine-tune | ✅ 知識蒸餾（600 張，隔離 test 鏡頭）；**test 鏡頭 mAP@0.5 = 94.1% / mAP50-95 = 0.890** |
-| serve | ✅ Ray Serve 相機推論（5 鏡頭輪詢 + 連續確認 + ROI + 車禍片段注入；餵 smart-traffic-ui，見 10A）|
-| monitor | ✅ RAY MONITOR 獨立叢集監控（節點負載 + Ray 元件活動 + object store，不佔 GPU，見 10B）|
-| tune | ✅ Ray Tune 超參搜尋（[tune_freeway.py](scripts/tune_freeway.py)，最佳超參已內建 finetune 預設）|
+| serve | ✅ Ray Serve 相機推論（**靜止車輛偵測為主** + 分類器輔助 + ROI + 注入驗證 + 自動清殘留，見 10A）|
+| monitor | ✅ RAY MONITOR 三欄滿版（節點負載/GPU nvidia-smi + Ray 元件滾動 log + **Pipeline 步驟圖**，見 10B）|
+| tune | ✅ Ray Tune **兩案皆用**（[tune_accident.py](scripts/tune_accident.py) + [tune_freeway.py](scripts/tune_freeway.py)）|
+| 一鍵流程 | ✅ [run_pipeline.py](scripts/run_pipeline.py)（合成→3 訓練→評估→serve，按序、即時寫監控步驟圖）|
 | 叢集 | ✅ 3 節點（1 head + 2 worker，同機多容器；docker-compose）|
 
 ### Held-out test 可信指標（三案總結）
 
-| 模型 | held-out test | 指標 | 對照舊 val |
+| 模型 | held-out test | 指標 | 備註 |
 |---|---|---|---|
-| Accident | 62 張（圖片級隔離）| **acc 88.7% / macro F1 0.886** | 舊 val 90.5%（揭露車禍漏報 7/31）|
-| Traffic | 12 序列 1417 幀（序列級）| **mAP@0.5 82.0% / R 0.879** | 舊 val ≈0.64（同序列洩漏）|
-| Freeway | 120 張 1 鏡頭（鏡頭級）| **mAP@0.5 94.1% / mAP50-95 0.890** | 舊 val ≈0.85（同鏡頭洩漏）|
+| Accident | 62 張土耳其 + 台灣域 diag | **acc 83.9% / 台灣域 C-B +0.295** | 合成資料 + Ray Tune；土耳其降 5pt 換台灣鑑別力 |
+| Traffic | 12 序列 1417 幀（序列級）| **mAP@0.5 82.6% / R 0.884** | 重訓穩定復現 |
+| Freeway | 120 張 1 鏡頭（鏡頭級）| **mAP@0.5 94.1% / mAP50-95 0.890** | 重訓完全復現 |
 
-**Ray 全家桶已到齊**：Data（串流管線）/ Train（兩 base 訓練）/ Tune（freeway 超參）/
-Serve（相機推論），外加 3 節點叢集與獨立 RAY MONITOR。**下一步**：補 Accident 案的
-資料缺口（找台灣道路車禍正樣本，讓 Accident 也能 fine-tune 解 domain gap 誤報）；
-serve 的 count/density 門檻校準。
+**Ray 全家桶已到齊**：Data / Train（兩 base）/ Tune（**兩案** accident + freeway）/ Serve，
+外加 3 節點叢集、RAY MONITOR（步驟圖）、一鍵 pipeline。**下一步**：取得真台灣車禍影像
+進一步微調分類器；serve 的 count/density 門檻校準。
 
-> **可信度升級**：三案都從「val（被調參污染）」改為「held-out test（訓練全程不可見）」。
-> Accident test 比舊 val 低 1.8pt 但揭露被藏住的漏報；Traffic/Freeway test 反而較高，
-> 因舊 val 有同序列/同鏡頭洩漏，新 test 是真正未見的序列/鏡頭。
+> **Accident 突破**：原本對台灣畫面無鑑別力（真事故與正常 P(accident) 都 ~0.88 重疊）。
+> 改用合成台灣車禍正樣本 + Ray Tune 搜超參（自動避開崩潰的高 lr），真車禍片段 0.50 vs
+> 正常 0.20（C-B +0.295）。部署再以靜止車輛偵測為主、分類器為輔，兩者互補。

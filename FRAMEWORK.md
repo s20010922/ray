@@ -4,12 +4,17 @@
 
 | 任務 | 型態 | 模型 | 資料集 | 訓練方式 | 角色 |
 |------|------|------|--------|--------|------|
-| **Accident** | 分類 | YOLO11n-cls | Roboflow 車禍圖 | Ray Train | **Base 模型**（獨立，無法 fine-tune：高公局無車禍影片）|
+| **Accident** | 分類 | YOLO11n-cls | Roboflow 車禍圖 + **台灣合成車禍** | Ray Train + Ray Tune | **Base 模型**（合成資料補台灣域）|
 | **Traffic** | 偵測 | YOLO11n | UA-DETRAC | Ray Train | **Base 模型**（偵測來源）|
-| **Freeway** | 偵測 | YOLO11n | 高公局 CCTV（yolo11x 自動標）| ultralytics | **不是獨立模型**：Traffic base 的蒸餾微調版 |
+| **Freeway** | 偵測 | YOLO11n | 高公局 CCTV（yolo11x 自動標）| ultralytics + Ray Tune | **不是獨立模型**：Traffic base 的蒸餾微調版 |
 
 > **Freeway 不是第三個 base**：它是 yolo11x（teacher）自動標高公局照片後，
 > 拿來 fine-tune Traffic base（student）的產物。知識蒸餾，零人工標註。
+>
+> **Accident 的台灣域問題已處理**：原本只有土耳其 CCTV 正樣本、對台灣高公局無鑑別力。
+> 改用 **合成貼合**（真台灣車貼到真高公局幀，擺成翻車/追撞/橫停姿態）產生台灣域正樣本，
+> 消除「哪國街景」捷徑。**Ray Tune（ASHA）兩案皆用**：Accident 搜 lr/batch/wd、Freeway 搜
+> 增強與 lr。部署時車禍判斷以**靜止車輛偵測**（建在偵測器上、看局部）為主、分類器為輔。
 
 ---
 
@@ -125,10 +130,12 @@ freeway_yolo/ 的 5 個鏡頭
 
 ### Accident（分類）
 - **指標**：accuracy / per-class precision / recall / F1 / macro F1 / confusion matrix
+  + 台灣域分離度（合成事故 A、真實正常 B、真車禍片段 C 的 P(accident) 差，見 `scripts/diag_accident_synth.py`）
 - **評估腳本**：`scripts/eval_accident.py`（吃 Ray Train checkpoint）
-- **Test set 結果**：✅ **test_acc = 88.7% / macro F1 = 0.886**（held-out 62 張）
-  - accident recall 0.774（31 件漏 7 件）、non-accident recall 1.0（零誤報）
-  - 舊 val_acc=90.5% 把「車禍漏報」藏住了，乾淨 test 才揭露
+- **Test set 結果（合成資料 + Ray Tune 最佳超參 lr 3.3e-4/bs 64/wd 3.8e-4）**：
+  - 土耳其 held-out test：**acc 83.9% / macro F1 0.837**（混入 80% 台灣資料，土耳其已半域外，較舊 88.7% 降）
+  - **台灣域鑑別力：C-B = +0.295**（真車禍片段 0.50 vs 正常 0.20，明確可分）——舊模型此值為**負**（無鑑別力）
+  - 結論：合成資料路線**成功**——用土耳其 test 5pt 的代價，換到部署域（台灣）的真鑑別力
 
 ### Traffic（偵測）
 - **指標**：mAP@0.5 / precision / recall / GT 框數 / 預測框數
@@ -265,10 +272,22 @@ ray_results/
 - monitor 不依賴 serve，叢集一啟動即可看（從零可見）。
 
 ### Serve 相機儀表板（:8000）
-- 5 鏡頭背景輪詢（demo `--poll-interval 2.0`，預設 4s），車禍連續確認門檻
-  `--accident-conf-th 0.97`（最近 5 幀連 3 幀超過才報），可 `--no-roi` 偵測全幅車輛。
-- 前端沿用 team edit `smart-traffic-ui` 並做可讀性改版（Cascadia Code 等寬字、提亮
-  對比、放大車流數字與事件 log），投影／錄影遠看清晰。
-- `/inject/<cam>` 可注入真實車禍片段驗證——實測證實 Accident 模型在此資料分佈無
-  鑑別力（見 §十 與 README §10）。
+- 5 鏡頭背景輪詢（demo `--poll-interval 2.0`，預設 4s），可 `--no-roi` 偵測全幅車輛。
+- **車禍判斷以「靜止車輛偵測」為主**（`src/infer/tracker.py`，輕量 IOU 追蹤器）：高速公路
+  正常車兩幀位移大、IOU 低不持續匹配；唯有停在車道的車持續高 IOU 且位移趨零，累計連續
+  靜止幀數達門檻（`--stall-frames 3`）即判事故，畫面標紅 STALLED。**不需任何車禍正樣本**。
+- 整幅分類器降為**輔助信號**（`--accident-conf-th` 僅報告用），注入驗證證實兩者互補：
+  靜止偵測抓到分類器漏掉的事故。
+- 啟動時自動清掉殘留 serve driver（`serve_dashboard.py` 掃 /proc），避免互搶。
+- 前端沿用 team edit `smart-traffic-ui` 並做可讀性改版。
+
+### 一鍵流程（`scripts/run_pipeline.py`）
+- 按順序跑：合成資料 → Accident 訓練 → Traffic 訓練 → Freeway 微調 → 三模型評估 → 上線 Serve。
+- 每階段把進度寫 `_pipeline_state.json`，RAY MONITOR 右欄步驟圖即時亮起當前階段、完成顯示 FINISH。
+- `--skip-synth` / `--no-serve` / `--from <stage>` 可調。
+
+### RAY MONITOR 升級（:8501）
+- 三欄滿版：叢集節點（每節點 Ray 任務數 + 即時負載，GPU 改讀 nvidia-smi）｜Ray 元件
+  （Data/Train/Tune/Serve 即時活動 + 滾動 log）｜Pipeline 流程步驟圖。
+- 以**執行中 job 進入點**歸屬元件（tune 內含 train，不重複點亮），並標註目前處理哪個案。
 

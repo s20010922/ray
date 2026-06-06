@@ -66,7 +66,8 @@ class TrafficMonitor:
                  use_roi: bool = True,
                  accident_conf_th: float = _ACC_CONF_TH_DEFAULT,
                  clip_dir: str =
-                 "/workspace/datasets/accident/video/accident"):
+                 "/workspace/datasets/accident/video/accident",
+                 device: str = "cuda"):
         from ultralytics import YOLO
 
         from src.infer.accident import find_best_accident_checkpoint
@@ -77,6 +78,7 @@ class TrafficMonitor:
         self.use_roi = use_roi
         self.accident_conf_th = accident_conf_th
         self.clip_dir = Path(clip_dir)
+        self.device = device   # cuda；demo 監控訓練時用 cpu 釋出 GPU
 
         # 車禍片段注入狀態：{cam_id: cv2.VideoCapture}（驗證用，手動觸發）
         self.inject_cap: Dict[str, "cv2.VideoCapture"] = {}
@@ -87,7 +89,7 @@ class TrafficMonitor:
 
         # Accident 分類：Ray Train checkpoint（state_dict）
         ckpt = accident_ckpt or find_best_accident_checkpoint()
-        self.classifier, self.acc_device = load_classifier(ckpt, device="cuda")
+        self.classifier, self.acc_device = load_classifier(ckpt, device=device)
 
         # 每鏡頭快取：最新標註 jpg bytes + json dict
         self.cache: Dict[str, dict] = {}
@@ -107,7 +109,7 @@ class TrafficMonitor:
 
         # Traffic 偵測
         res = self.detector.predict(img, imgsz=self.imgsz, conf=self.conf,
-                                    verbose=False)[0]
+                                    device=self.device, verbose=False)[0]
         boxes = res.boxes.xyxy.cpu().numpy() if res.boxes is not None \
             else np.zeros((0, 4), np.float32)
         scores = res.boxes.conf.cpu().numpy() if res.boxes is not None \

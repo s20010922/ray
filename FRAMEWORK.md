@@ -241,8 +241,34 @@ ray_results/
 | 項目 | 舊流程 | 新流程 |
 |------|--------|--------|
 | **Accident 資料** | train/val（team edit，不平衡 1:2） | train/val/test（重切自 Image/，平衡） |
-| **Accident 指標** | val_acc=90.5%（污染） | test_acc=?（乾淨） |
-| **Traffic 指標** | 無（只有訓練 loss） | test_mAP@0.5 on DETRAC 隔離 test |
-| **Freeway 指標** | val_mAP@0.5（train/val 無隔離） | test_mAP@0.5（隔離的 test set） |
+| **Accident 指標** | val_acc=90.5%（污染） | test_acc=88.7%（乾淨） |
+| **Traffic 指標** | 無（只有訓練 loss） | test_mAP@0.5=82.0%（DETRAC 隔離 test） |
+| **Freeway 指標** | val_mAP@0.5（train/val 無隔離） | test_mAP@0.5=94.1%（隔離 test 鏡頭） |
 | **可信度** | ❌ 低（val 被污染） | ✅ 高（test 隔離） |
+
+---
+
+## 十一、部署與監控（叢集 + 服務）
+
+### 3 節點叢集
+- 1 head（8 CPU + 1 GPU）+ 2 worker（各 4 CPU），同一台機器多容器。
+- Ray Data 前處理會分散到 3 節點，object store 跨節點傳資料。
+- 啟動：`docker compose up -d ray-head ray-worker-1 ray-worker-2`
+
+### 兩個服務（獨立）
+| 服務 | 程式 | 埠 | GPU | 角色 |
+|------|------|----|-----|------|
+| **Serve 相機推論** | `scripts/serve_dashboard.py` + `src/serve/` | 8000 | ✅ 佔用 | 5 鏡頭即時偵測畫面、車禍片段注入驗證 |
+| **RAY MONITOR** | `scripts/monitor.py` + `src/monitor/` | 8501 | ❌ 不需 | 叢集節點負載 + Ray 元件活動（觀察者）|
+
+- 只有 1 顆 GPU，serve 推論與訓練不可同搶；demo 邊訓練邊看監控時 serve 用 `--no-gpu`。
+- monitor 不依賴 serve，叢集一啟動即可看（從零可見）。
+
+### Serve 相機儀表板（:8000）
+- 5 鏡頭背景輪詢（demo `--poll-interval 2.0`，預設 4s），車禍連續確認門檻
+  `--accident-conf-th 0.97`（最近 5 幀連 3 幀超過才報），可 `--no-roi` 偵測全幅車輛。
+- 前端沿用 team edit `smart-traffic-ui` 並做可讀性改版（Cascadia Code 等寬字、提亮
+  對比、放大車流數字與事件 log），投影／錄影遠看清晰。
+- `/inject/<cam>` 可注入真實車禍片段驗證——實測證實 Accident 模型在此資料分佈無
+  鑑別力（見 §十 與 README §10）。
 

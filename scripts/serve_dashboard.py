@@ -38,13 +38,19 @@ def main():
     ap.add_argument("--clip-dir",
                     default="/workspace/datasets/accident/video/accident",
                     help="車禍片段資料夾（注入驗證用）")
+    ap.add_argument("--no-gpu", action="store_true",
+                    help="CPU 推論並釋出 GPU（demo 時邊訓練邊看 RAY MONITOR 用）")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
     init_ray()
     serve.start(http_options={"host": "0.0.0.0", "port": args.port})
 
-    monitor = TrafficMonitor.bind(
+    gpus = 0 if args.no_gpu else 1
+    device = "cpu" if args.no_gpu else "cuda"
+    monitor = TrafficMonitor.options(
+        ray_actor_options={"num_gpus": gpus, "num_cpus": 2}
+    ).bind(
         detector_weights=args.detector,
         accident_ckpt=args.accident_ckpt,
         poll_interval=args.poll_interval,
@@ -53,6 +59,7 @@ def main():
         use_roi=not args.no_roi,
         accident_conf_th=args.accident_conf_th,
         clip_dir=args.clip_dir,
+        device=device,
     )
     serve.run(monitor, name="traffic_monitor", route_prefix="/")
 

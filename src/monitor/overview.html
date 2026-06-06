@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>RAY MONITOR · 系統總覽</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#070b12; --card:#0d1424; --card2:#121b30; --card3:#16203a;
+  --nb:#22d3ff; --ng:#2dffa0; --nr:#ff3b5c; --no:#ffa033; --np:#c08bff;
+  --tp:#eaf4ff; --ts:#9fb6d4; --tm:#6d86a6;
+  --mono:'Cascadia Code','Consolas','Courier New',monospace;
+  --line:rgba(34,211,255,.20);
+}
+html,body{height:100%}
+body{background:
+   radial-gradient(1200px 600px at 80% -10%,rgba(34,211,255,.06),transparent),
+   var(--bg);
+  color:var(--tp);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  font-size:15px;line-height:1.5;display:flex;flex-direction:column;min-height:100vh}
+header{display:flex;align-items:center;justify-content:space-between;
+  padding:16px 28px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg,#0b1322,#070b12);flex-shrink:0}
+.htitle{font-size:19px;font-weight:800;letter-spacing:4px;color:var(--nb);
+  text-shadow:0 0 16px rgba(34,211,255,.55)}
+.hsub{font-size:11.5px;color:var(--ts);letter-spacing:1.5px;margin-top:4px}
+.hclock{font-family:var(--mono);font-size:18px;color:var(--nb);letter-spacing:2px;font-weight:600}
+.wrap{flex:1;display:grid;grid-template-columns:380px 1fr;gap:18px;
+  padding:18px 24px;align-items:stretch;max-width:1500px;width:100%;margin:0 auto}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:20px 22px;display:flex;flex-direction:column;
+  box-shadow:0 4px 24px rgba(0,0,0,.3),inset 0 0 30px rgba(0,0,0,.25)}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.pt{font-size:14px;font-weight:800;letter-spacing:2px;color:var(--ng);text-transform:uppercase}
+.pt .zh{display:block;color:var(--ts);font-weight:500;letter-spacing:1px;font-size:11px;margin-top:3px}
+.dot{width:9px;height:9px;border-radius:50%;background:#2a3a52;display:inline-block}
+.dot.ok{background:var(--ng);box-shadow:0 0 10px var(--ng);animation:p 1.3s infinite}
+.dot.warn{background:var(--nr);box-shadow:0 0 10px var(--nr)}
+.dot.idle{background:#3a4d68}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.35}}
+.big{font-size:46px;font-weight:800;color:var(--nb);font-family:var(--mono);line-height:1;
+  text-shadow:0 0 20px rgba(34,211,255,.4)}
+.big small{font-size:14px;color:var(--ts);font-weight:500;margin-left:6px}
+.rlabel{display:flex;justify-content:space-between;font-size:12.5px;
+  font-family:var(--mono);color:var(--ts);margin-top:14px;margin-bottom:6px}
+.rlabel b{color:var(--tp)}
+.bar{height:9px;background:#0a111f;border-radius:5px;overflow:hidden;border:1px solid rgba(34,211,255,.1)}
+.bar>div{height:100%;background:linear-gradient(90deg,var(--nb),var(--ng));
+  transition:width .5s;box-shadow:0 0 10px rgba(45,255,160,.4)}
+.nodes{display:flex;flex-direction:column;gap:11px;margin-top:18px}
+.node{display:flex;flex-direction:column;gap:8px;padding:13px 15px;
+  background:var(--card2);border:1px solid var(--line);border-radius:10px;transition:.3s}
+.node.busy{border-color:rgba(45,255,160,.4);background:var(--card3)}
+.node .ntop{display:flex;align-items:center;gap:10px}
+.node .role{font-size:10.5px;font-weight:800;letter-spacing:1px;padding:4px 10px;border-radius:5px;white-space:nowrap}
+.role.Head{color:var(--no);background:rgba(255,160,51,.1);border:1px solid rgba(255,160,51,.45)}
+.role.Worker{color:var(--np);background:rgba(192,139,255,.1);border:1px solid rgba(192,139,255,.45)}
+.node .nname{font-size:14px;font-weight:700;color:var(--tp)}
+.node .tasks{font-family:var(--mono);font-size:12px;font-weight:700;padding:3px 9px;border-radius:5px;
+  color:var(--tm);border:1px solid var(--line)}
+.node .tasks.on{color:#062;background:var(--ng);box-shadow:0 0 10px rgba(45,255,160,.5)}
+.node .nip{font-family:var(--mono);font-size:11px;color:var(--tm);margin-left:auto}
+.node .res{font-family:var(--mono);font-size:12px;color:var(--ts);letter-spacing:.2px}
+.node .res b{color:var(--ng);font-weight:700}
+.node .load{display:flex;align-items:center;gap:9px;margin-top:6px}
+.node .llabel{font-family:var(--mono);font-size:11px;color:var(--tm);width:34px;flex-shrink:0}
+.node .lbar{flex:1;height:7px;background:#0a111f;border-radius:4px;overflow:hidden;border:1px solid rgba(34,211,255,.1)}
+.node .lbar>div{height:100%;transition:width .5s}
+.node .ltxt{font-family:var(--mono);font-size:11.5px;color:var(--ts);white-space:nowrap;width:48px;text-align:right}
+.node .ltxt b{color:var(--tp);font-weight:700}
+.lvl-lo>div{background:linear-gradient(90deg,#1c6,var(--ng))}
+.lvl-mid>div{background:linear-gradient(90deg,var(--no),#fc4)}
+.lvl-hi>div{background:linear-gradient(90deg,#c33,var(--nr))}
+.comp{flex:1;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:1fr;gap:16px}
+.citem{background:var(--card2);border:1px solid var(--line);border-radius:12px;
+  padding:20px 22px;display:flex;flex-direction:column;transition:.3s}
+.citem.on{border-color:rgba(45,255,160,.5);background:var(--card3);box-shadow:0 0 24px rgba(45,255,160,.1)}
+.crow{display:flex;align-items:center;justify-content:space-between}
+.cname{font-size:20px;font-weight:800;color:var(--nb);letter-spacing:.5px}
+.cstate{font-size:10.5px;font-weight:800;letter-spacing:1.5px;padding:5px 11px;border-radius:6px}
+.cstate.act{color:#062;background:var(--ng);box-shadow:0 0 12px rgba(45,255,160,.5)}
+.cstate.idle{color:var(--tm);border:1px solid var(--line)}
+.cdoing{font-size:15px;color:var(--tp);margin-top:18px;font-weight:600;
+  display:flex;align-items:center;gap:10px;min-height:24px}
+.cdesc{font-size:12.5px;color:var(--ts);margin-top:auto;padding-top:16px;line-height:1.6;
+  border-top:1px solid rgba(34,211,255,.1)}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="htitle">◆ RAY MONITOR</div>
+    <div class="hsub">高速公路 CCTV 車流／車禍偵測 · Ray 叢集即時監控</div>
+  </div>
+  <div class="hclock" id="clk">--:--:--</div>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <div class="ph">
+      <div class="pt">Cluster Nodes<span class="zh">叢集節點</span></div>
+      <span class="dot" id="cdot"></span>
+    </div>
+    <div class="big"><span id="nodeN">–</span><small>active nodes</small></div>
+    <div class="rlabel"><span>CPU</span><b id="cpuTxt">–</b></div>
+    <div class="bar"><div id="cpuBar" style="width:0%"></div></div>
+    <div class="rlabel"><span>GPU</span><b id="gpuTxt">–</b></div>
+    <div class="bar"><div id="gpuBar" style="width:0%"></div></div>
+    <div class="rlabel"><span>OBJ STORE</span><b id="objTxt">–</b></div>
+    <div class="bar"><div id="objBar" style="width:0%"></div></div>
+    <div class="nodes" id="nodeList"></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <div class="pt">Ray Components<span class="zh">技術堆疊 · 即時活動</span></div>
+      <span class="dot ok"></span>
+    </div>
+    <div class="comp">
+      <div class="citem" id="c-data"><div class="crow"><div class="cname">Ray Data</div><div class="cstate idle" id="s-data">IDLE</div></div>
+        <div class="cdoing"><span class="dot idle" id="d-data"></span><span id="doing-data">–</span></div>
+        <div class="cdesc" id="desc-data">串流資料管線</div></div>
+      <div class="citem" id="c-train"><div class="crow"><div class="cname">Ray Train</div><div class="cstate idle" id="s-train">IDLE</div></div>
+        <div class="cdoing"><span class="dot idle" id="d-train"></span><span id="doing-train">–</span></div>
+        <div class="cdesc" id="desc-train">分散式訓練</div></div>
+      <div class="citem" id="c-tune"><div class="crow"><div class="cname">Ray Tune</div><div class="cstate idle" id="s-tune">IDLE</div></div>
+        <div class="cdoing"><span class="dot idle" id="d-tune"></span><span id="doing-tune">–</span></div>
+        <div class="cdesc" id="desc-tune">超參搜尋</div></div>
+      <div class="citem" id="c-serve"><div class="crow"><div class="cname">Ray Serve</div><div class="cstate idle" id="s-serve">IDLE</div></div>
+        <div class="cdoing"><span class="dot idle" id="d-serve"></span><span id="doing-serve">–</span></div>
+        <div class="cdesc" id="desc-serve">即時推論服務</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+function clock(){document.getElementById('clk').textContent=new Date().toLocaleTimeString('zh-TW',{hour12:false});}
+setInterval(clock,1000); clock();
+
+const lvl=p=>p>=80?'lvl-hi':p>=40?'lvl-mid':'lvl-lo';
+const loadRow=(label,pct,txt)=>
+  '<div class="load"><span class="llabel">'+label+'</span>'+
+  '<div class="lbar '+lvl(pct)+'"><div style="width:'+pct+'%"></div></div>'+
+  '<span class="ltxt">'+(txt!==undefined?txt:'<b>'+pct+'%</b>')+'</span></div>';
+
+async function pollCluster(){
+  try{
+    const r=await fetch('/cluster.json?_='+Date.now(),{signal:AbortSignal.timeout(6000)});
+    if(!r.ok) throw 0;
+    const d=await r.json();
+    document.getElementById('cdot').className='dot ok';
+    document.getElementById('nodeN').textContent=d.node_count;
+    const cp=d.cpu_total?(d.cpu_used/d.cpu_total*100):0, gp=d.gpu_total?(d.gpu_used/d.gpu_total*100):0;
+    document.getElementById('cpuTxt').textContent=d.cpu_used+' / '+d.cpu_total+' ('+cp.toFixed(0)+'%)';
+    document.getElementById('gpuTxt').textContent=d.gpu_used+' / '+d.gpu_total+' ('+gp.toFixed(0)+'%)';
+    document.getElementById('cpuBar').style.width=cp+'%';
+    document.getElementById('gpuBar').style.width=gp+'%';
+    document.getElementById('objTxt').textContent=d.obj_used_gb+' / '+d.obj_total_gb+'G ('+d.obj_pct+'%)';
+    document.getElementById('objBar').style.width=d.obj_pct+'%';
+    document.getElementById('nodeList').innerHTML=d.nodes.map((n,i)=>
+      '<div class="node'+(n.ray_tasks>0?' busy':'')+'">'+
+        '<div class="ntop">'+
+          '<span class="role '+n.role+'">'+n.role+'</span>'+
+          '<span class="nname">'+(n.alive?'●':'○')+' 節點 '+(i+1)+'</span>'+
+          '<span class="tasks'+(n.ray_tasks>0?' on':'')+'">⚡'+n.ray_tasks+' 任務</span>'+
+          '<span class="nip">'+n.address+'</span>'+
+        '</div>'+
+        '<div class="res">CPU <b>'+n.cpu+'</b>核 · GPU <b>'+n.gpu+'</b> · RAM <b>'+n.mem_gb+'G</b> · OBJ <b>'+n.obj_gb+'G</b></div>'+
+        loadRow('Ray', n.ray_pct, '<b>'+n.ray_tasks+'</b>/'+n.cpu)+
+        (n.gpu ? loadRow('GPU', n.gpu_pct) : '')+
+        loadRow('MEM', n.mem_pct)+
+        loadRow('OBJ', n.obj_pct)+
+      '</div>').join('');
+  }catch(e){ document.getElementById('cdot').className='dot warn'; }
+}
+
+function setComp(key,c){
+  document.getElementById('c-'+key).className='citem'+(c.active?' on':'');
+  const st=document.getElementById('s-'+key);
+  st.className='cstate '+(c.active?'act':'idle'); st.textContent=c.active?'ACTIVE':'IDLE';
+  document.getElementById('d-'+key).className='dot '+(c.active?'ok':'idle');
+  document.getElementById('doing-'+key).textContent=c.doing;
+  if(typeof c.detail==='string') document.getElementById('desc-'+key).textContent=c.detail;
+}
+async function pollComponents(){
+  try{
+    const r=await fetch('/components.json?_='+Date.now(),{signal:AbortSignal.timeout(6000)});
+    if(!r.ok) throw 0;
+    const d=await r.json();
+    ['data','train','tune','serve'].forEach(k=>setComp(k,d[k]));
+  }catch(e){}
+}
+pollCluster(); pollComponents();
+setInterval(pollCluster,2000);
+setInterval(pollComponents,2000);
+</script>
+</body>
+</html>

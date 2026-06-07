@@ -37,6 +37,8 @@ x-bind-mounts: &bind-mounts
   - ./scripts:/workspace/scripts:ro
   - ./ray_results:/workspace/ray_results
   - F:/dataset:/data/detrac:ro          # UA-DETRAC 原始資料（唯讀）
+  - F:/DoTA:/data/dota:ro               # DoTA 車禍資料集（唯讀）
+  - ./ACCIDENT:/data/accident:ro        # AccidentBench 真實事故影片（唯讀）
   - ./datasets:/workspace/datasets       # 轉檔後的 YOLO 格式資料（可寫）
 
 services:

@@ -1,293 +1,76 @@
 # 整套框架釐清
 
-## 一、兩個 Base 模型 + 一個 Fine-tune
+> 本檔說明系統各部分如何組合。完整操作見 [README.md](README.md)，演進與除錯見 [NOTE.md](NOTE.md)。
 
-| 任務 | 型態 | 模型 | 資料集 | 訓練方式 | 角色 |
-|------|------|------|--------|--------|------|
-| **Accident** | 分類 | YOLO11n-cls | Roboflow 車禍圖 + **台灣合成車禍** | Ray Train + Ray Tune | **Base 模型**（合成資料補台灣域）|
-| **Traffic** | 偵測 | YOLO11n | UA-DETRAC | Ray Train | **Base 模型**（偵測來源）|
-| **Freeway** | 偵測 | YOLO11n | 高公局 CCTV（yolo11x 自動標）| ultralytics + Ray Tune | **不是獨立模型**：Traffic base 的蒸餾微調版 |
+## 一、兩個模型、兩條流程
 
-> **Freeway 不是第三個 base**：它是 yolo11x（teacher）自動標高公局照片後，
-> 拿來 fine-tune Traffic base（student）的產物。知識蒸餾，零人工標註。
->
-> **Accident 的台灣域問題已處理**：原本只有土耳其 CCTV 正樣本、對台灣高公局無鑑別力。
-> 改用 **合成貼合**（真台灣車貼到真高公局幀，擺成翻車/追撞/橫停姿態）產生台灣域正樣本，
-> 消除「哪國街景」捷徑。**Ray Tune（ASHA）兩案皆用**：Accident 搜 lr/batch/wd、Freeway 搜
-> 增強與 lr。部署時車禍判斷以**靜止車輛偵測**（建在偵測器上、看局部）為主、分類器為輔。
+| 流程 | 模型 | 型態 | 資料 | 訓練方式 | 角色 |
+|------|------|------|------|----------|------|
+| **車流（Freeway）** | YOLO11s | 物件偵測 | 高公局 CCTV（yolo11x+SAHI 自動標）| ultralytics + Ray 四階段 | 偵測前端骨幹 |
+| **車禍（Accident）** | LSTM/GRU/1D-CNN | 軌跡時序分類 | AccidentBench 真實高速公路事故 | Ray 四階段 | 事故判斷後端 |
 
----
-
-## 二、資料來源結構
+兩個模型**不是平行獨立**，而是**前後串接**：YOLO 偵測 + ByteTrack 追蹤是共用前端，
+車流走「計數／密度」、車禍走「軌跡→運動特徵→時序模型」。
 
 ```
-datasets/
-├── accident/                          ← Roboflow CCTV（分類）
-│   ├── Image/                         （原始，未切）
-│   │   ├── accident/       (212 張)
-│   │   └── non-accident/   (212 張)
-│   ├── train/              (目前 510 張，需重切)
-│   ├── val/                (目前 92 張，需重切)
-│   └── test/               (空，需切出)
-│
-├── freeway_raw/                       ← 高公局 CCTV 抓取（原始）
-│   ├── CCTV-N1-N-37.050-M/  (200 張)
-│   ├── CCTV-N1-S-34.018-M/  (201 張)  ← 最多
-│   ├── CCTV-N1-S-93.080-M/  (200 張)
-│   ├── CCTV-N1H-S-17.450-M/ (200 張)
-│   └── CCTV-N3-S-40.980-M/  (200 張)
-│   = 5 個鏡頭，1001 張獨立資料
-│
-├── freeway_yolo/                      ← COCO 自動標（已標註）
-│   ├── images/              (600 張，來自上面白天部分)
-│   ├── labels/              (600 個 .txt，YOLO 格式)
-│   └── data.yaml
-│
-├── freeway_det/                       ← 切好的訓練結構（ultralytics）
-│   ├── images/
-│   │   ├── train/           (需重切 + test)
-│   │   └── val/
-│   ├── labels/
-│   │   ├── train/
-│   │   └── val/
-│   └── data.yaml
-│
-└── /data/detrac/                      ← UA-DETRAC（偵測，只讀）
-    ├── DETRAC-Images/       (100 序列，含標註的 60 個)
-    └── DETRAC-Train-Annotations-XML/  (60 個 XML)
+            YOLO 偵測 + ByteTrack 追蹤（共用前端）
+                        │
+            ┌───────────┴───────────┐
+          車流計數                事故時序判斷
+        （用框數量）        （軌跡→運動特徵→LSTM）
 ```
 
----
+## 二、為什麼車禍模型「跨資料集」可行
 
-## 三、訓練路線圖
-
-```
-【第一階段：訓練 Base 模型】
-
-官方 yolo11n-cls.pt ──→ 用 Roboflow Accident 資料訓練 ──→ Accident Base（分類）
-                       Ray Train + 劣化增強              val_acc ~90%（舊 val 指標）
-                       
-官方 yolo11n.pt ──────→ 用 UA-DETRAC 資料訓練 ────────→ Traffic Base（偵測）
-                       Ray Train + 劣化增強             UA-DETRAC val mAP@0.5 ≈ 0.64
-
-【第二階段：Fine-tune】
-
-官方 yolo11n.pt ──────→ 用 Freeway COCO 自動標訓練 ────→ Freeway Model（偵測）
-                       ultralytics + 劣化增強           高公局 val mAP@0.5 ≈ 0.85
-                       
-           （或改為：Traffic Base → Fine-tune）
-```
-
----
-
-## 四、資料切分策略
-
-### Accident（分類）
-**目前問題**：train/val 不平衡（1:2），且被訓練污染（調參用）
-
-**新策略**：
-```
-Image/（原始 424 張，平衡）
-  └─ split.py 按類別分層抽樣
-       ├─ train/ 70% (297 張)
-       ├─ val/   15% (64 張)
-       └─ test/  15% (63 張)  ← 新增，完全隔離
-```
-- 確保三份的 accident:non-accident 比例一致
-- test set 在訓練全程不載入
-
-### Traffic（DETRAC 偵測）
-**目前問題**：60 個序列無 test 隔離（全部混在 train/val）
-
-**新策略**：
-```
-60 個序列
-  └─ split.py 按序列分層分割
-       ├─ train/ 60% 的序列
-       ├─ val/   20% 的序列
-       └─ test/  20% 的序列  ← 新增，完全隔離
-       
-每序列內幀數不變，只是序列級別隔離（避免同序列的相鄰幀洩漏）
-```
-
-### Freeway（高公局 CCTV）
-**目前問題**：freeway_yolo 無 test 隔離（全 600 張混在 train/val）
-
-**新策略**：
-```
-freeway_yolo/ 的 5 個鏡頭
-  └─ make_det_split(test_ratio=0.1)
-       ├─ train/ 4 個鏡頭 (480 張)
-       ├─ val/   同 4 個鏡頭 (120 張)
-       └─ test/  1 個鏡頭 (60 張)  ← 新增，完全隔離
-       
-整鏡頭級別隔離（避免同鏡頭的相同視角幀洩漏）
-```
-
----
-
-## 五、評估指標
-
-### Accident（分類）
-- **指標**：accuracy / per-class precision / recall / F1 / macro F1 / confusion matrix
-  + 台灣域分離度（合成事故 A、真實正常 B、真車禍片段 C 的 P(accident) 差，見 `scripts/diag_accident_synth.py`）
-- **評估腳本**：`scripts/eval_accident.py`（吃 Ray Train checkpoint）
-- **Test set 結果（合成資料 + Ray Tune 最佳超參 lr 3.3e-4/bs 64/wd 3.8e-4）**：
-  - 土耳其 held-out test：**acc 83.9% / macro F1 0.837**（混入 80% 台灣資料，土耳其已半域外，較舊 88.7% 降）
-  - **台灣域鑑別力：C-B = +0.295**（真車禍片段 0.50 vs 正常 0.20，明確可分）——舊模型此值為**負**（無鑑別力）
-  - 結論：合成資料路線**成功**——用土耳其 test 5pt 的代價，換到部署域（台灣）的真鑑別力
-
-### Traffic（偵測）
-- **指標**：mAP@0.5 / precision / recall / GT 框數 / 預測框數
-- **評估腳本**：`scripts/eval_traffic.py`（吃 Ray Train checkpoint，自寫 mAP）
-- **Test set 結果**：✅ **mAP@0.5 = 82.0% / recall 0.879**（12 個 held-out 序列、1417 幀）
-
-### Freeway（偵測）
-- **指標**：mAP@0.5 / mAP@0.5:0.95 / precision / recall
-- **評估腳本**：`scripts/eval_freeway.py`（吃 ultralytics best.pt，用原生 val）
-- **Test set 結果**：✅ **mAP@0.5 = 94.1% / mAP50-95 = 0.890**（held-out 鏡頭 120 張）
-  - test 比 val(0.92) 還高 → 對未見鏡頭泛化良好
-
----
-
-## 六、執行順序（優先級）
-
-### 🔴 Phase 1：Accident Base（高優先）
-```
-1. python src/data/accident/split.py
-   └─ 從 Image/ 重切 → accident/{train,val,test}/{accident,non-accident}/
-
-2. python scripts/train_accident.py --epochs 50
-   └─ Ray Train，載 train/val，隔離 test
-
-3. python scripts/eval_accident.py
-   └─ 在 test set 上跑，看真實指標（vs 舊 val_acc=90.5%）
-```
-
-### 🔴 Phase 2：Traffic Base（高優先）
-```
-1. 建立 src/data/traffic/split.py（還未實現）
-   └─ 從 DETRAC 60 序列，依序列切 train/val/test
-
-2. python scripts/train_traffic.py --epochs 30
-   └─ Ray Train，載 train/val，隔離 test
-
-3. python scripts/eval_traffic.py
-   └─ 在 test set 上跑（目前跑的是 val）
-```
-
-### 🟡 Phase 3：Freeway Fine-tune（中優先）
-```
-1. python scripts/finetune_freeway.py --epochs 100 --test-ratio 0.1
-   └─ ultralytics train，自動切 test，載 train/val，隔離 test
-
-2. python scripts/eval_freeway.py
-   └─ 在 test set 上跑（需新建）
-```
-
----
-
-## 七、檔案與腳本映射
-
-| 任務 | 切分 | 訓練 | 評估 | 狀態 |
-|------|------|------|------|------|
-| Accident | `src/data/accident/split.py` ✅ | `scripts/train_accident.py` ✅ | `scripts/eval_accident.py` ✅ | ✅ test_acc 88.7% |
-| Traffic | `src/data/traffic/split.py` ✅ | `scripts/train_traffic.py` ✅ | `scripts/eval_traffic.py` ✅（改寫吃 DETRAC test）| ✅ test mAP@0.5 82.0% |
-| Freeway | `src/data/freeway/split.py` ✅ | `scripts/finetune_freeway.py` ✅ | `scripts/eval_freeway.py` ✅（新建，ultralytics val）| ✅ test mAP@0.5 94.1% |
-
----
-
-## 八、預期產出
+時序模型**吃抽象運動數字、不吃像素**。像素差異（畫質／角度／解析度）在偵測+追蹤
+那關被吸收，流到時序模型的只剩速度、加速度、車距、航向變化等物理量 —— 這些量在
+AccidentBench 與高公局之間意義一致。
 
 ```
-ray_results/
-├── accident/TorchTrainer_*/
-│   └── checkpoint_00NNN/
-│       └── model.pt  ← 新訓練的 checkpoint
-│
-├── traffic/TorchTrainer_*/
-│   └── checkpoint_00NNN/
-│       └── model.pt  ← 新訓練的 checkpoint
-│
-└── freeway_final/weights/
-    ├── best.pt  ← fine-tune 的最佳權重
-    └── last.pt
-
-評估結果（log）：
-├── Accident: test_accuracy=?,  macro_f1=?
-├── Traffic: test_mAP@0.5=?
-└── Freeway: test_mAP@0.5=?
+AccidentBench（訓練）──yolo11x──┐
+                                ├─►[速度,加速度,車距,…]─► 同一個時序模型
+高公局 CCTV（部署）──yolo11s────┘
 ```
 
----
+→ 換資料集 / 換部署場景**只換前端偵測器**，時序模型與特徵公式不動。fps 也要對齊
+（訓練降採樣到部署等效 ~10fps）。
 
-## 九、關鍵概念
+## 三、資料來源（現行）
 
-### Held-out Test Set
-- **定義**：訓練全程完全不見的資料
-- **目的**：無偏評估模型泛化能力
-- **實踐**：
-  - Accident：按類別分層，保留 15% 為 test
-  - Traffic：按序列分層，保留 20% 的序列為 test
-  - Freeway：按鏡頭分層，保留 1 個鏡頭為 test
+```
+/data/accident/                 ← AccidentBench（唯讀掛載 ./ACCIDENT）
+├── real_videos/                  2027 支真實事故影片（YouTube 來源）
+└── metadata-real.csv             事故幀/事故框/型態/場景/晝夜/畫質
+     → 篩 highway+day+畫質OK = 271 支對齊高公局子集
 
-### 劣化增強（兩案共用）
-- **降解析度**：模擬高公局 352×240
-- **JPEG 壓縮**、**模糊**、**噪點** ：模擬低畫質
-- **只在 train 做增強**，val/test 不做
+datasets/                        （可寫）
+├── weights/yolo11x.pt            追蹤用 teacher（離線預先下載）
+├── freeway_yolo/                 高公局自動標註結果（車流訓練輸入）
+└── accident_seq/                 ① Ray Data 產出：train/val/test.npz + scaler + clips.json
+```
 
-### 資料隔離級別
-- **Accident**：圖片級（同圖不跨 split）
-- **Traffic**：序列級（同序列的幀不跨 split）
-- **Freeway**：鏡頭級（同鏡頭的幀不跨 split）
+> 舊系統的 UA-DETRAC／Roboflow／合成台灣車禍／DoTA／CADP／UCF-Crime 已**不再使用**
+> （資料集評選結論見 NOTE.md：唯 AccidentBench 同時滿足「真實事故 + 可偵測 + domain 對 + 可下載」）。
 
----
+## 四、Ray 四階段對應
 
-## 十、與舊流程的差異
+| 階段 | 車流（Freeway） | 車禍（Accident） | 用到哪些節點 |
+|------|------|------|------|
+| ① Data | 鏡頭級切分、CPU 前處理 | yolo11x+ByteTrack 追蹤抽軌跡 | 車流：CPU 多節點／車禍：GPU(head) |
+| ② Tune | ultralytics ASHA（GPU） | ASHA 搜時序超參（**CPU 三節點平行**）| 車禍 Tune 才會吃滿 2 個 worker |
+| ③ Train | TorchTrainer + yolo11s（GPU） | TorchTrainer + 時序模型 | head(GPU) |
+| ④ Serve | 多鏡頭儀表板（:8000） | 接前端後的時序判斷（規劃中）| head(GPU) |
 
-| 項目 | 舊流程 | 新流程 |
-|------|--------|--------|
-| **Accident 資料** | train/val（team edit，不平衡 1:2） | train/val/test（重切自 Image/，平衡） |
-| **Accident 指標** | val_acc=90.5%（污染） | test_acc=88.7%（乾淨） |
-| **Traffic 指標** | 無（只有訓練 loss） | test_mAP@0.5=82.0%（DETRAC 隔離 test） |
-| **Freeway 指標** | val_mAP@0.5（train/val 無隔離） | test_mAP@0.5=94.1%（隔離 test 鏡頭） |
-| **可信度** | ❌ 低（val 被污染） | ✅ 高（test 隔離） |
+> **節點配置邏輯**：GPU 只有 head 一顆，GPU 綁定工作（追蹤／偵測訓練／推論）只在 head；
+> 兩個 CPU-only worker 唯一真正吃滿的場景是**車禍模型的 CPU 平行 Ray Tune**（時序模型小，
+> CPU 訓練快，ASHA 多試驗同時跑）。這也是「三節點叢集」名副其實之處。
 
----
+## 五、關鍵設計取捨
 
-## 十一、部署與監控（叢集 + 服務）
-
-### 3 節點叢集
-- 1 head（8 CPU + 1 GPU）+ 2 worker（各 4 CPU），同一台機器多容器。
-- Ray Data 前處理會分散到 3 節點，object store 跨節點傳資料。
-- 啟動：`docker compose up -d ray-head ray-worker-1 ray-worker-2`
-
-### 兩個服務（獨立）
-| 服務 | 程式 | 埠 | GPU | 角色 |
-|------|------|----|-----|------|
-| **Serve 相機推論** | `scripts/serve_dashboard.py` + `src/serve/` | 8000 | ✅ 佔用 | 5 鏡頭即時偵測畫面、車禍片段注入驗證 |
-| **RAY MONITOR** | `scripts/monitor.py` + `src/monitor/` | 8501 | ❌ 不需 | 叢集節點負載 + Ray 元件活動（觀察者）|
-
-- 只有 1 顆 GPU，serve 推論與訓練不可同搶；demo 邊訓練邊看監控時 serve 用 `--no-gpu`。
-- monitor 不依賴 serve，叢集一啟動即可看（從零可見）。
-
-### Serve 相機儀表板（:8000）
-- 5 鏡頭背景輪詢（demo `--poll-interval 2.0`，預設 4s），可 `--no-roi` 偵測全幅車輛。
-- **車禍判斷以「靜止車輛偵測」為主**（`src/infer/tracker.py`，輕量 IOU 追蹤器）：高速公路
-  正常車兩幀位移大、IOU 低不持續匹配；唯有停在車道的車持續高 IOU 且位移趨零，累計連續
-  靜止幀數達門檻（`--stall-frames 3`）即判事故，畫面標紅 STALLED。**不需任何車禍正樣本**。
-- 整幅分類器降為**輔助信號**（`--accident-conf-th` 僅報告用），注入驗證證實兩者互補：
-  靜止偵測抓到分類器漏掉的事故。
-- 啟動時自動清掉殘留 serve driver（`serve_dashboard.py` 掃 /proc），避免互搶。
-- 前端沿用 team edit `smart-traffic-ui` 並做可讀性改版。
-
-### 一鍵流程（`scripts/run_pipeline.py`）
-- 按順序跑：合成資料 → Accident 訓練 → Traffic 訓練 → Freeway 微調 → 三模型評估 → 上線 Serve。
-- 每階段把進度寫 `_pipeline_state.json`，RAY MONITOR 右欄步驟圖即時亮起當前階段、完成顯示 FINISH。
-- `--skip-synth` / `--no-serve` / `--from <stage>` 可調。
-
-### RAY MONITOR 升級（:8501）
-- 三欄滿版：叢集節點（每節點 Ray 任務數 + 即時負載，GPU 改讀 nvidia-smi）｜Ray 元件
-  （Data/Train/Tune/Serve 即時活動 + 滾動 log）｜Pipeline 流程步驟圖。
-- 以**執行中 job 進入點**歸屬元件（tune 內含 train，不重複點亮），並標註目前處理哪個案。
-
+| 議題 | 決定 | 理由 |
+|------|------|------|
+| 事故資料 | AccidentBench 真實片（非合成）| 唯一同時可偵測+domain 對+真實事故的可下載資料 |
+| 前端偵測 | 訓練 yolo11x / 部署 yolo11s | 訓練要強跨域偵測；部署用高公局自身微調模型 |
+| 正樣本標註 | 肇事車（IoU 最高軌跡）±1s | 排除正常過路車的標籤雜訊 |
+| 不平衡 | pos_weight + AP 指標 + 分層切分 | 事故正樣本僅約 1%，accuracy 無意義 |
+| 追蹤器 | ByteTrack（ultralytics 內建）| 純運動、輕量，足以串軌跡算運動特徵 |

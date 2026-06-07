@@ -23,13 +23,27 @@ _DATA_HIST = deque(maxlen=14)
 _DATA_HIST_T = [0.0]
 
 
+def _friendly_op(name: str) -> str:
+    """Ray Data 運算元名稱 → 白話。"""
+    n = name.lower()
+    if "map" in n or "_process" in n or "batch" in n:
+        return "前處理影像"
+    if "read" in n or "from_items" in n or "fromitems" in n:
+        return "讀取影像"
+    if "split" in n:
+        return "切分資料"
+    if "write" in n:
+        return "寫出資料"
+    return name.split("(")[0].split(".")[0]
+
+
 def _data_log_rolling(data_ops):
-    """更新並回傳 Ray Data 的滾動歷史 log。"""
+    """更新並回傳 Ray Data 的滾動歷史 log（白話 + 並行任務數）。"""
     now = time.time()
-    if data_ops and now - _DATA_HIST_T[0] >= 1.8:
+    if data_ops and now - _DATA_HIST_T[0] >= 0.8:
         _DATA_HIST_T[0] = now
         summ = " · ".join(
-            f"{k.split('(')[0].split('.')[0]}×{v}"
+            f"{_friendly_op(k)} {v} 個並行"
             for k, v in data_ops.most_common(3))
         _DATA_HIST.append(f"{time.strftime('%H:%M:%S')}  {summ}")
     return list(_DATA_HIST)
@@ -53,9 +67,9 @@ def _serve_camera_log(active):
             url = f"http://localhost:8000/live_focus/{cam.cctv_id}.json"
             with urllib.request.urlopen(url, timeout=0.6) as r:
                 d = json.load(r)
-            flag = "⚠事故" if d.get("is_accident") else "正常"
             out.append(f"{cam.cctv_id[:20]}  車{d.get('num_detections', 0)} · "
-                       f"密度{d.get('density_level', '?')} · {flag}")
+                       f"數量{d.get('count_level', '?')} · "
+                       f"密度{d.get('density_level', '?')}")
         except Exception:
             continue
     return out
@@ -104,17 +118,16 @@ def _running_tasks_per_node():
     return per_node
 
 
-def _recent_metrics(experiments, limit=12):
+def _recent_metrics(experiments, limit=12, base="/workspace/ray_results"):
     """某類實驗最新一次 run 的近幾筆 epoch 報告（給卡片中間當即時 log）。
 
-    Ray Train 每次 report 會往 run 目錄的 result.json 追加一行 JSON；取
-    mtime 最新的 result.json 末幾行，解析成可讀的指標行（accident 報 val_acc、
-    traffic 報 val_loss）。
+    Ray Train / ultralytics Tune 每 epoch 會往 run 目錄的 result.json 追加一行
+    JSON；取 mtime 最新的 result.json 末幾行，解析成可讀的指標行。experiments
+    可含萬用字元（如 "tune*"），base 指定根目錄（Tune 在 runs/detect 下）。
     """
     files = []
     for e in experiments:
-        files += glob.glob(
-            f"/workspace/ray_results/{e}/**/result.json", recursive=True)
+        files += glob.glob(f"{base}/{e}/**/result.json", recursive=True)
     if not files:
         return []
     try:
@@ -135,6 +148,20 @@ def _recent_metrics(experiments, limit=12):
                else f"it{d.get('training_iteration', '?')}"]
         if d.get("train_loss") is not None:
             seg.append(f"loss {d['train_loss']:.3f}")
+        # mAP：Ray Train 報 mAP50/mAP50_95；ultralytics Tune 報 metrics/mAP50(B)
+        m50 = d.get("mAP50", d.get("metrics/mAP50(B)"))
+        m5095 = d.get("mAP50_95", d.get("metrics/mAP50-95(B)"))
+        if m50 is not None:
+            seg.append(f"mAP50 {m50:.3f}")
+        if m5095 is not None:
+            seg.append(f"mAP50-95 {m5095:.3f}")
+        # 事故時序模型：Ray Tune/Train 報 ap/recall/f1
+        if d.get("ap") is not None:
+            seg.append(f"AP {d['ap']:.3f}")
+        if d.get("recall") is not None:
+            seg.append(f"recall {d['recall']:.2f}")
+        if d.get("f1") is not None:
+            seg.append(f"f1 {d['f1']:.2f}")
         if d.get("val_acc") is not None:
             seg.append(f"val_acc {d['val_acc']:.3f}")
         elif d.get("val_loss") is not None:
@@ -145,63 +172,67 @@ def _recent_metrics(experiments, limit=12):
 
 _PIPE_STATE_FILE = "/workspace/ray_results/_pipeline_state.json"
 
-# 完整流程的標準階段（run_pipeline.py 與監控步驟圖共用此順序）
+# Ray 標準四階段流程（freeway：Ray Data → Tune → Train → Serve）
 _PIPELINE_STAGES = [
-    ("synth", "合成資料"),
-    ("train_accident", "Accident 訓練"),
-    ("train_traffic", "Traffic 訓練"),
-    ("finetune_freeway", "Freeway 微調"),
-    ("eval", "三模型評估"),
-    ("serve", "上線 Serve"),
+    ("prepare", "① Ray Data 前處理"),
+    ("tune", "② Ray Tune 超參搜尋"),
+    ("train", "③ Ray Train 正式訓練"),
+    ("serve", "④ Ray Serve 上線"),
 ]
 
 
-def pipeline_state():
-    """流程步驟圖狀態：優先用 run_pipeline.py 寫的 state file；否則由執行中 job 推斷。
-
-    回傳 {stages:[{id,label}], current, done:[id], status}。
-    """
-    default_stages = [{"id": i, "label": l} for i, l in _PIPELINE_STAGES]
-
-    # 先讀 run_pipeline.py 寫的 state file（可能不存在）
-    st = None
+def _exists(p):
     try:
-        if os.path.exists(_PIPE_STATE_FILE):
-            with open(_PIPE_STATE_FILE, encoding="utf-8") as f:
-                st = json.load(f)
+        return os.path.exists(p)
     except Exception:
-        st = None
+        return False
 
-    # 1) 進行中的 pipeline（近 120s 內更新）→ 最優先
-    if st and time.time() - st.get("updated", 0) < 120:
-        return {
-            "stages": st.get("stages") or default_stages,
-            "current": st.get("current"),
-            "done": st.get("done", []),
-            "status": st.get("status", "running"),
-        }
 
-    # 2) 由執行中 job 推斷（單獨跑某腳本時也能亮對應階段）
+def pipeline_state():
+    """兩條流程狀態：車流（freeway，已完成可上線）與車禍（accident）。
+
+    回傳 {pipelines:[{name, stages, current, done:[id], ready, status}, ...]}。
+    """
+    stages = [{"id": i, "label": l} for i, l in _PIPELINE_STAGES]
     ids = [i for i, _ in _PIPELINE_STAGES]
-    kind, label = _active_job()
-    job_to_stage = {
-        ("train", "Accident 分類"): "train_accident",
-        ("train", "Traffic 偵測"): "train_traffic",
-        ("finetune", "Traffic（Freeway 微調）"): "finetune_freeway",
-    }
-    cur = job_to_stage.get((kind, label))
-    if cur is None and _serve_alive():
-        cur = "serve"
-    if cur:
-        return {"stages": default_stages, "current": cur,
-                "done": ids[:ids.index(cur)], "status": "running"}
+    job_to_stage = {"data": "prepare", "tune": "tune", "train": "train"}
+    kind, case = _active_job()
+    cur_stage = job_to_stage.get(kind)
 
-    # 3) 沒有進行中的工作 → 顯示上次 pipeline 的完成狀態（黏著 finish 提示）
-    if st and st.get("status") == "done":
-        return {"stages": st.get("stages") or default_stages,
-                "current": None, "done": st.get("done", []), "status": "done"}
+    # ── 車流（Freeway）：模型已訓練完成、可上線 ──
+    fw_serve = _serve_alive()
+    traffic = {"name": "車流偵測（Freeway）", "stages": stages,
+               "current": None, "ready": None,
+               "done": ["prepare", "tune", "train"],
+               "status": "done" if fw_serve else "ready"}
+    if fw_serve:
+        traffic["done"].append("serve")
+    else:
+        traffic["ready"] = "serve"          # 訓練完成、待上線
+    if case == "freeway" and cur_stage:     # freeway 任務正在跑 → 反映進度
+        traffic.update(current=cur_stage, ready=None, status="running",
+                       done=ids[:ids.index(cur_stage)])
 
-    return {"stages": default_stages, "current": None, "done": [], "status": "idle"}
+    # ── 車禍（Accident）：依產物與執行中任務推斷 ──
+    acc_done = []
+    if _exists("/workspace/datasets/accident_seq/train.npz"):
+        acc_done.append("prepare")
+    if _exists("/workspace/ray_results/accident_final/accident_seq.pt"):
+        acc_done = ["prepare", "tune", "train"]
+    acc_cur, acc_ready, acc_status = None, None, "idle"
+    if case == "accident" and cur_stage:
+        acc_cur = cur_stage
+        acc_done = ids[:ids.index(cur_stage)]
+        acc_status = "running"
+    elif "train" in acc_done:
+        acc_status = "done"
+    elif acc_done:
+        acc_status = "partial"
+    accident = {"name": "車禍偵測（Accident）", "stages": stages,
+                "current": acc_cur, "ready": acc_ready,
+                "done": acc_done, "status": acc_status}
+
+    return {"pipelines": [traffic, accident]}
 
 
 def _serve_alive():
@@ -217,14 +248,12 @@ def _serve_alive():
 
 
 def _active_job():
-    """從執行中 job 的進入點判斷 (kind, label)。
+    """從執行中 job 的進入點判斷 (kind, case)。
 
-    kind ∈ {'train', 'tune', 'finetune', ''}；label 是模型/案別中文。
+    kind ∈ {'data', 'tune', 'train', ''}；case ∈ {'freeway', 'accident', ''}。
     關鍵：tune_* 內部是「Ray Tune 包 TorchTrainer」，會產生 RayTrainWorker
     actor。若只看 actor 會把 Tune 誤認成 Train。改以 job 進入點為準歸屬：
-    tune_* → Tune（不重複點亮 Train）；train_* → Train。
-
-    Freeway 不是獨立案，是 Traffic 案的 Freeway 微調版，故 label 收進 Traffic。
+    prepare_* → Ray Data；tune_* → Tune（不重複點亮 Train）；train_* → Train。
     """
     try:
         from ray.util.state import list_jobs
@@ -232,16 +261,13 @@ def _active_job():
             if "RUNNING" not in str(getattr(j, "status", "")).upper():
                 continue
             ep = (getattr(j, "entrypoint", "") or "").lower()
-            if "train_accident" in ep:
-                return ("train", "Accident 分類")
-            if "train_traffic" in ep:
-                return ("train", "Traffic 偵測")
-            if "tune_accident" in ep:
-                return ("tune", "Accident 分類")
-            if "tune_freeway" in ep:
-                return ("tune", "Traffic（Freeway 微調）")
-            if "finetune_freeway" in ep:
-                return ("finetune", "Traffic（Freeway 微調）")
+            case = "accident" if "accident" in ep else "freeway"
+            if "prepare_" in ep:
+                return ("data", case)
+            if "tune_" in ep:
+                return ("tune", case)
+            if "train_" in ep:
+                return ("train", case)
     except Exception as e:
         print(f"[monitor] job 查詢失敗：{type(e).__name__}: {e}")
     return ("", "")
@@ -332,7 +358,8 @@ def components_state():
         print(f"[monitor] 元件查詢失敗：{type(e).__name__}: {e}")
 
     kind, case = _active_job()           # 以執行中 job 歸屬（tune 內含 train）
-    tag = f"（{case}）" if case else ""
+    case_zh = {"freeway": "Freeway 偵測", "accident": "事故偵測"}.get(case, "")
+    tag = f"（{case_zh}）" if case_zh else ""
     # tune_* 的 trial 內部用 TorchTrainer worker；歸給 Tune，不重複點亮 Train
     train_active = train_n > 0 and kind != "tune"
     tune_active = kind == "tune" or tune_n > 0
@@ -342,36 +369,41 @@ def components_state():
                 "log": log or []}
 
     data_log = _data_log_rolling(data_ops)          # 滾動歷史（時間戳 + 運算元）
-    train_log = _recent_metrics(["accident", "traffic"])
-    tune_log = _recent_metrics(["accident_tune", "freeway_tune"])
+    # 依案別選 log 來源：事故走 Ray Tune/Train（ray_results）；freeway 走 ultralytics
+    if case == "accident":
+        tune_log = _recent_metrics(["accident_tune"])
+        train_log = _recent_metrics(["accident_final_raytrain", "accident_final"])
+    else:
+        tune_log = _recent_metrics(["tune*"], base="/workspace/runs/detect")
+        train_log = _recent_metrics(["freeway_final_raytrain", "freeway_final"])
 
     return {
         "data": comp(
             data_tasks > 0,
             f"處理中 {data_tasks} 個 batch task{tag}" if data_tasks
-            else "閒置（訓練時啟動串流前處理）",
-            "解碼 → 劣化增強 → resize → 多節點平行前處理",
+            else "閒置（等待前處理）",
+            "把資料分成 訓練／驗證／測試 三份",
             data_log),
-        "train": comp(
-            train_active,
-            f"{train_n} 個 worker 訓練中{tag}" if train_active
-            else "閒置（待 train_accident / train_traffic）",
-            f"TorchTrainer · 目前：{case}（在 head GPU 上）"
-            if kind == "train" and case
-            else "TorchTrainer：Accident 分類、Traffic 偵測（跑在 head GPU）",
-            train_log),
         "tune": comp(
             tune_active,
             f"搜尋中{tag} · trial 訓練中" if tune_active
-            else "閒置（待 tune_accident / tune_freeway）",
-            f"ASHA 超參搜尋 · 目前：{case}（內部用 TorchTrainer）"
-            if tune_active and case
-            else "ASHA 超參搜尋：兩案皆可（Traffic 的 Freeway 微調、Accident 分類）",
+            else "閒置（等待超參搜尋）",
+            f"正在自動試參數，找最準的設定 · {case_zh}"
+            if tune_active and case_zh
+            else "自動試多組參數設定，挑出表現最準的一組",
             tune_log),
+        "train": comp(
+            train_active,
+            f"{train_n} 個 worker 訓練中{tag}" if train_active
+            else "閒置（等待正式訓練）",
+            f"正在用最佳設定正式訓練 · {case_zh}（用 GPU）"
+            if kind == "train" and case_zh
+            else "用最佳設定正式訓練模型",
+            train_log),
         "serve": comp(
             serve_n > 0,
             f"{serve_n} 個 replica 運行中" if serve_n
-            else "未啟動（serve_dashboard.py）",
-            "即時推論服務：5 鏡頭車流／車禍偵測",
+            else "未啟動（待 serve_dashboard.py）",
+            "把訓練好的模型上線，5 個鏡頭即時偵測車流／車禍",
             _serve_camera_log(serve_n > 0)),
     }

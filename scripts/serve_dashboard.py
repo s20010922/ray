@@ -56,25 +56,14 @@ def _kill_stale_serve_drivers():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="高公局即時監控 Ray Serve")
+    ap = argparse.ArgumentParser(description="高公局即時車流監控 Ray Serve")
     ap.add_argument("--detector",
                     default="/workspace/ray_results/freeway_final/weights/best.pt",
-                    help="Traffic 偵測權重（ultralytics best.pt）")
-    ap.add_argument("--accident-ckpt", default=None,
-                    help="Accident 分類 checkpoint；省略則自動找最新")
+                    help="車流偵測權重（freeway yolo11s best.pt）")
     ap.add_argument("--poll-interval", type=float, default=4.0)
     ap.add_argument("--conf", type=float, default=0.4, help="偵測信心門檻")
-    ap.add_argument("--accident-conf-th", type=float, default=0.97,
-                    help="整幅分類器輔助門檻（domain-gap 不可靠，僅報告用）")
-    ap.add_argument("--stall-frames", type=int, default=3,
-                    help="車道內車輛連續靜止幾幀視為事故（poll 2s 時 3≈6 秒）")
-    ap.add_argument("--move-frac", type=float, default=0.15,
-                    help="中心位移 < move-frac × box 對角線 → 判定未移動")
-    ap.add_argument("--imgsz", type=int, default=960)
-    ap.add_argument("--no-roi", action="store_true", help="關閉 ROI 幾何過濾")
-    ap.add_argument("--clip-dir",
-                    default="/workspace/datasets/accident/video/accident",
-                    help="車禍片段資料夾（注入驗證用）")
+    ap.add_argument("--imgsz", type=int, default=640,
+                    help="推論輸入尺寸（對齊訓練 imgsz）")
     ap.add_argument("--no-gpu", action="store_true",
                     help="CPU 推論並釋出 GPU（demo 時邊訓練邊看 RAY MONITOR 用）")
     ap.add_argument("--port", type=int, default=8000)
@@ -94,15 +83,9 @@ def main():
         ray_actor_options={"num_gpus": gpus, "num_cpus": 2}
     ).bind(
         detector_weights=args.detector,
-        accident_ckpt=args.accident_ckpt,
         poll_interval=args.poll_interval,
         conf=args.conf,
         imgsz=args.imgsz,
-        use_roi=not args.no_roi,
-        accident_conf_th=args.accident_conf_th,
-        stall_frames=args.stall_frames,
-        move_frac=args.move_frac,
-        clip_dir=args.clip_dir,
         device=device,
     )
     serve.run(monitor, name="traffic_monitor", route_prefix="/")

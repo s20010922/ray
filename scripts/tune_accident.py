@@ -1,79 +1,61 @@
-"""車禍分類超參搜尋（Ray Tune + Ray Train）。
+"""Stage 2 入口：事故時序模型 Ray Tune(ASHA)— CPU 三節點平行搜參。
 
-動機：Accident 對超參極敏感——實測 lr=1e-3 會讓加入合成台灣資料後的訓練崩潰
-（全判非事故、train_loss 衝到 ~3），lr=1e-4 才穩定收斂。與其手動試 lr，讓 ASHA
-在多組 lr / batch_size / weight_decay 間分時搜尋、提早砍掉崩潰 trial，自動挑最佳。
+模型小,每組試驗只吃 CPU → head + 2 worker 同時跑多組,worker 終於派上用場。
 
-與 freeway 的差異：freeway 用 ultralytics 內建 model.tune(use_ray=True)；accident
-是自刻的 Ray Train TorchTrainer，故用原生 Ray Tune——Tuner 包 TorchTrainer，
-param_space 覆寫 train_loop_config，沿用 trainer 內建的 RunConfig/CheckpointConfig。
-
-  # 先小規模驗證（2 trial、各 5 epoch）
-  docker compose exec ray-head python scripts/tune_accident.py --iterations 2 --epochs 5
-  # 正式搜尋
-  docker compose exec ray-head python scripts/tune_accident.py --iterations 12 --epochs 30
-
-註：in-loop 指標是 val_acc（土耳其 held-out）。它足以讓 ASHA 避開崩潰區
-（崩潰模型 val_acc≈0.5），但台灣域鑑別力仍須事後用注入驗證／diag 腳本確認。
-單 GPU 下各 trial 依序跑（ScalingConfig 每 trial 佔 1 GPU）。
+  docker compose exec ray-head python scripts/tune_accident.py --samples 24
 """
-
-# BLAS 執行緒上限要在 import numpy/torch/cv2 前設好。
-import os
-for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-           "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_v, "1")
 
 import argparse
 
-from src.core.cluster import init_ray
-from src.train.accident.trainer import build_trainer
+import ray
+import torch
+from ray import train, tune
+from ray.tune.schedulers import ASHAScheduler
+
+from src.train.accident.trainer import DATA_DIR, fit
+
+
+def trainable(config):
+    fit(config, torch.device("cpu"), report=lambda m: train.report(m))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="車禍分類超參搜尋（Ray Tune）")
-    ap.add_argument("--epochs", type=int, default=30, help="每個 trial 的 epoch 上限")
-    ap.add_argument("--iterations", type=int, default=12, help="trial 數（超參組合）")
-    ap.add_argument("--grace-period", type=int, default=8,
-                    help="ASHA 最少跑幾 epoch 才可被砍（須 ≤ epochs）")
+    ap = argparse.ArgumentParser(description="事故時序模型 Ray Tune (CPU 平行)")
+    ap.add_argument("--data-dir", default=DATA_DIR)
+    ap.add_argument("--samples", type=int, default=24, help="超參組合數")
+    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--cpus-per-trial", type=int, default=2)
     args = ap.parse_args()
 
-    from ray import tune
-    from ray.tune import TuneConfig, Tuner
-    from ray.tune.schedulers import ASHAScheduler
-
-    init_ray()
-
-    # 沿用 accident 的 Ray Train 骨架，輸出到獨立實驗 accident_tune（不蓋正式模型）
-    trainer = build_trainer(epochs=args.epochs, experiment_name="accident_tune")
-
-    # 搜尋空間：lr 跨數量級（涵蓋崩潰的 1e-3 與穩定的 1e-4）→ log 尺度
-    space = {"train_loop_config": {
+    ray.init(address="auto", ignore_reinit_error=True)
+    space = {
+        "data_dir": args.data_dir,
         "epochs": args.epochs,
-        "lr": tune.loguniform(1e-5, 3e-3),
-        "batch_size": tune.choice([16, 32, 64]),
-        "weight_decay": tune.loguniform(1e-6, 1e-2),
-    }}
-
-    grace = min(args.grace_period, args.epochs)   # ASHA 要求 grace_period ≤ max_t
-    tuner = Tuner(
-        trainer,
+        "kind": tune.choice(["lstm", "gru", "cnn"]),
+        "hidden": tune.choice([32, 64, 128]),
+        "layers": tune.choice([1, 2]),
+        "dropout": tune.uniform(0.0, 0.4),
+        "lr": tune.loguniform(1e-4, 5e-3),
+        "weight_decay": tune.loguniform(1e-6, 1e-3),
+        "batch": tune.choice([128, 256, 512]),
+    }
+    scheduler = ASHAScheduler(metric="ap", mode="max", max_t=args.epochs,
+                              grace_period=min(5, args.epochs))
+    tuner = tune.Tuner(
+        tune.with_resources(trainable, {"cpu": args.cpus_per_trial}),
         param_space=space,
-        tune_config=TuneConfig(
-            scheduler=ASHAScheduler(max_t=args.epochs, grace_period=grace,
-                                    reduction_factor=2),
-            num_samples=args.iterations,
-            metric="val_acc",
-            mode="max",
-        ),
+        tune_config=tune.TuneConfig(num_samples=args.samples,
+                                    scheduler=scheduler),
+        run_config=train.RunConfig(name="accident_tune",
+                                   storage_path="/workspace/ray_results"),
     )
     results = tuner.fit()
-
-    best = results.get_best_result(metric="val_acc", mode="max")
-    print("=== Ray Tune（accident）完成 ===")
-    print("最佳超參：", best.config.get("train_loop_config"))
-    print("最佳 val_acc：", best.metrics.get("val_acc"))
-    print("結果在 /workspace/ray_results/accident_tune（各 trial + 最佳）")
+    best = results.get_best_result(metric="ap", mode="max")
+    print("\n=== 最佳超參 ===")
+    print(best.config)
+    print("=== 最佳驗證指標 ===")
+    print({k: round(v, 4) for k, v in best.metrics.items()
+           if k in ("ap", "recall", "precision", "f1", "val_loss")})
 
 
 if __name__ == "__main__":

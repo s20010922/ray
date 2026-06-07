@@ -1,78 +1,80 @@
-"""把 freeway_yolo（images+labels 平鋪）切成 ultralytics 訓練結構。
+"""freeway_yolo 切分為 train/val/test（鏡頭級隔離）。
 
-依「鏡頭」分層切 train/val/test（整個鏡頭為單位），避免同一鏡頭的幀
-跨 split 造成資料洩漏。
-
-test_ratio > 0 時輸出三分 split：
-  out_root/
-    images/{train,val,test}/*.jpg
-    labels/{train,val,test}/*.txt
-    data.yaml  （只含 train/val，供 ultralytics train 用）
-
-test 鏡頭在訓練全程不可見，僅供最終 eval 用。
+同一鏡頭固定機位、相鄰幀高度相似，若跨 split 會洩漏。故保留 1 個完整鏡頭
+做 held-out test，其餘鏡頭再分層切 train/val。輸出 ultralytics 用的
+train.txt/val.txt/test.txt + dataset.yaml（label 由 images→labels 路徑推得）。
 """
 
 import random
-import shutil
-from collections import defaultdict
+import re
 from pathlib import Path
-from typing import Tuple
 
-from src.modeling.traffic import CLASSES
+_CAM = re.compile(r"^(CCTV-[^_]+)_")
 
 
-def make_det_split(src_root: str, out_root: str,
-                   val_ratio: float = 0.2, test_ratio: float = 0.1,
-                   seed: int = 42) -> Tuple[str, int, int, int]:
-    """切 train/val/test 並複製成 ultralytics 結構。
+def _camera(name: str):
+    m = _CAM.match(name)
+    return m.group(1) if m else name
 
-    鏡頭整批分配：先保留 test_ratio 的鏡頭為 test，剩餘鏡頭再切 val_ratio 為 val。
 
-    Returns:
-        (data.yaml 路徑, n_train, n_val, n_test)
+def split_paths(root: str = "/workspace/datasets/freeway_yolo",
+                test_cam: str = "CCTV-N1-S-93.080-M",
+                val_ratio: float = 0.2, seed: int = 42) -> dict:
+    """鏡頭級切分，回傳 {'train':[Path...], 'val':[...], 'test':[...]}。
+
+    test_cam 整顆鏡頭做 held-out test；其餘鏡頭分層切 train/val。
     """
-    src, out = Path(src_root), Path(out_root)
-    imgs = sorted((src / "images").glob("*.jpg"))
-
-    groups = defaultdict(list)
+    root = Path(root)
+    imgs = sorted((root / "images").glob("*.jpg"))
+    by_cam = {}
     for p in imgs:
-        groups[p.stem.split("_")[0]].append(p)   # 依 cctv_id 分組
+        by_cam.setdefault(_camera(p.name), []).append(p)
+    cams = sorted(by_cam)
+    if test_cam not in by_cam:
+        raise ValueError(f"test_cam {test_cam} 不在鏡頭清單 {cams}")
 
-    cams = sorted(groups.keys())
     rng = random.Random(seed)
-    rng.shuffle(cams)
-
-    # 先從尾端切出 test 鏡頭（整鏡頭隔離）
-    n_test_cams = max(1, int(len(cams) * test_ratio)) if test_ratio > 0 else 0
-    test_cams = set(cams[-n_test_cams:]) if n_test_cams else set()
-    remain_cams = [c for c in cams if c not in test_cams]
-
     train, val, test = [], [], []
-    for cam in remain_cams:
-        ps = groups[cam][:]
-        rng.shuffle(ps)
-        k = int(len(ps) * val_ratio)
-        val.extend(ps[:k])
-        train.extend(ps[k:])
-    for cam in test_cams:
-        test.extend(groups[cam])
+    for cam in cams:
+        files = sorted(by_cam[cam])
+        if cam == test_cam:
+            test.extend(files)
+            continue
+        rng.shuffle(files)
+        n_val = round(len(files) * val_ratio)
+        val.extend(files[:n_val])
+        train.extend(files[n_val:])
+    return {"train": sorted(train), "val": sorted(val), "test": sorted(test)}
 
-    splits = [("train", train), ("val", val)]
-    if test:
-        splits.append(("test", test))
 
-    for split, ps in splits:
-        (out / "images" / split).mkdir(parents=True, exist_ok=True)
-        (out / "labels" / split).mkdir(parents=True, exist_ok=True)
-        for p in ps:
-            shutil.copy2(p, out / "images" / split / p.name)
-            lbl = src / "labels" / f"{p.stem}.txt"
-            if lbl.exists():
-                shutil.copy2(lbl, out / "labels" / split / f"{p.stem}.txt")
+def make_split(root: str = "/workspace/datasets/freeway_yolo",
+               test_cam: str = "CCTV-N1-S-93.080-M",
+               val_ratio: float = 0.2, seed: int = 42) -> str:
+    """寫出 train/val/test 清單與 dataset.yaml，回傳 yaml 路徑。"""
+    root = Path(root)
+    sp = split_paths(root, test_cam, val_ratio, seed)
+    train, val, test = sp["train"], sp["val"], sp["test"]
 
-    names = "\n".join(f"  {i}: {c}" for i, c in enumerate(CLASSES))
-    yaml_path = out / "data.yaml"
+    for name, items in (("train", train), ("val", val), ("test", test)):
+        (root / f"{name}.txt").write_text(
+            "\n".join(str(p) for p in sorted(items)))
+
+    yaml_path = root / "dataset.yaml"
     yaml_path.write_text(
-        f"path: {out}\ntrain: images/train\nval: images/val\n\n"
-        f"nc: {len(CLASSES)}\nnames:\n{names}\n")
-    return str(yaml_path), len(train), len(val), len(test)
+        f"path: {root}\ntrain: train.txt\nval: val.txt\ntest: test.txt\n"
+        f"nc: 1\nnames: ['Vehicle']\n")
+
+    print(f"[切分] 鏡頭級隔離 test={test_cam}")
+    print(f"  train {len(train)}（{len(cams)-1} 鏡頭）"
+          f"／val {len(val)}／test {len(test)}（1 鏡頭）→ {yaml_path}")
+    return str(yaml_path)
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default="/workspace/datasets/freeway_yolo")
+    ap.add_argument("--test-cam", default="CCTV-N1-S-93.080-M")
+    ap.add_argument("--val-ratio", type=float, default=0.2)
+    args = ap.parse_args()
+    make_split(args.root, args.test_cam, args.val_ratio)

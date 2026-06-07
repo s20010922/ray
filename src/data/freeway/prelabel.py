@@ -1,96 +1,110 @@
-"""高公局影像「模型輔助預標」：用自訓 base model 產生 YOLO 標籤草稿。
+"""高公局 CCTV 影像自動標籤（teacher：YOLO11x COCO + SAHI 切片）。
 
-流程：base model 偵測 → 寫 YOLO 格式 .txt（人工再用 labelImg/Label Studio 修正）。
-預標只是「省人力的草稿」，不是最終標註——base 有 domain gap，遠處小車會漏，
-人工務必補漏、刪錯。
-
-輸出結構（與 detrac_yolo 一致，方便之後 fine-tune 直接吃）：
-  out_root/
-    images/<原圖檔名>.jpg      （複製，保留原檔名含鏡頭+時間戳）
-    labels/<原圖檔名>.txt      （YOLO：class xc yc w h，正規化）
-    preview/<原圖檔名>.jpg     （畫框預覽，給人眼快速掃過用，可選）
-    data.yaml
+高公局影像為 352x240 低畫質固定機位，遠處車小且糊。整幅 YOLO 會漏遠車，
+故以 SAHI 切片（192x192）放大小目標召回；切片結果預設已與整幅偵測 NMS 合併。
+COCO 的 car/bus/truck/motorcycle 一律併為單類 Vehicle，輸出 YOLO 偵測格式。
 """
 
+import re
 import shutil
 from pathlib import Path
-from typing import List
 
 import cv2
 
-from src.data.freeway.roi import (cam_id_from_filename, draw_roi,
-                                  filter_by_roi, get_roi)
-from src.infer.traffic import detect as detect_traffic, draw
-from src.modeling.traffic import CLASSES
+# COCO 車輛類別 → 單類 Vehicle
+VEHICLE_COCO_IDS = {2, 3, 5, 7}        # car, motorcycle, bus, truck
+_TS = re.compile(r"_\d{8}_(\d{2})\d{4}_")   # 檔名 _YYYYMMDD_HHMMSS_
 
 
-def _to_yolo_lines(boxes_xyxy, w0: int, h0: int) -> List[str]:
-    """xyxy 像素 → YOLO 行（class xc yc w h，正規化，單類 class=0）。"""
-    lines = []
-    for x1, y1, x2, y2 in boxes_xyxy:
-        xc = ((x1 + x2) * 0.5) / w0
-        yc = ((y1 + y2) * 0.5) / h0
-        bw = (x2 - x1) / w0
-        bh = (y2 - y1) / h0
-        lines.append(f"0 {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
-    return lines
+def _hour(path: Path):
+    m = _TS.search(path.name)
+    return int(m.group(1)) if m else None
 
 
-def prelabel(model, image_paths: List[str], out_root: str,
-             conf: float = 0.25, preview: bool = True,
-             use_roi: bool = True, detect_fn=None) -> dict:
-    """對一批高公局影像產生 YOLO 預標。
+def collect_images(raw_root: str, sample: int = 0,
+                   hour_lo: int = 6, hour_hi: int = 18) -> list:
+    """掃 freeway_raw 各鏡頭子夾的 jpg。
 
-    Args:
-        use_roi: 是否套用 per-cam ROI 過濾。先做物件標記時設 False（標所有車，
-                 ROI 留到推論階段再用）。
-        detect_fn: 偵測函數 (model, img, conf) -> (boxes_xyxy, scores)。
-                   None=用自訓 base；可傳 coco_vehicle.detect 改用官方 COCO 模型。
-    Returns:
-        {"n_images", "n_boxes", "n_empty"}：處理張數、總框數、零框張數。
+    只取白天 [hour_lo, hour_hi] 時段（濾掉凌晨空路）；跳過非 CCTV 彙整夾。
+    sample>0 則每鏡頭等間隔抽 N 張（涵蓋整段時間）。
     """
-    _detect = detect_fn or detect_traffic
+    root = Path(raw_root)
+    paths = []
+    for cam_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if not cam_dir.name.startswith("CCTV"):
+            continue                       # 跳過 "all pic" 彙整夾
+        imgs = sorted(p for p in cam_dir.glob("*.jpg")
+                      if (h := _hour(p)) is not None and hour_lo <= h <= hour_hi)
+        if sample > 0 and len(imgs) > sample:
+            step = len(imgs) / sample
+            imgs = [imgs[int(i * step)] for i in range(sample)]
+        paths.extend(imgs)
+    return [str(p) for p in paths]
+
+
+def _load_model(weights: str, conf: float, device: str):
+    from sahi import AutoDetectionModel
+    return AutoDetectionModel.from_pretrained(
+        model_type="ultralytics", model_path=weights,
+        confidence_threshold=conf, device=device)
+
+
+def prelabel(raw_root: str, out_root: str, weights: str = "yolo11x.pt",
+             conf: float = 0.25, slice_size: int = 192, overlap: float = 0.25,
+             hour_lo: int = 6, hour_hi: int = 18, sample: int = 0,
+             preview: bool = True, device: str = "cuda:0") -> dict:
+    """自動標籤主流程，輸出 YOLO 偵測資料集到 out_root。"""
+    from sahi.predict import get_sliced_prediction
+
     out = Path(out_root)
-    (out / "images").mkdir(parents=True, exist_ok=True)
-    (out / "labels").mkdir(parents=True, exist_ok=True)
-    if preview:
-        (out / "preview").mkdir(parents=True, exist_ok=True)
-    # labelImg 的 YOLO 模式需要 classes.txt（類別順序）在 save_dir（labels/）。
-    (out / "labels" / "classes.txt").write_text("\n".join(CLASSES) + "\n")
+    img_dir = out / "images"
+    lbl_dir = out / "labels"
+    pv_dir = out / "preview"
+    for d in (img_dir, lbl_dir, pv_dir if preview else img_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    n_boxes, n_empty = 0, 0
-    for p in image_paths:
-        img = cv2.imread(p)
-        if img is None:
+    model = _load_model(weights, conf, device)
+    paths = collect_images(raw_root, sample, hour_lo, hour_hi)
+    print(f"[資料] 待標 {len(paths)} 張（時段 {hour_lo}-{hour_hi} 時，"
+          f"切片 {slice_size}px／重疊 {overlap}／conf {conf}）")
+
+    n_boxes = n_empty = 0
+    for i, p in enumerate(paths, 1):
+        im = cv2.imread(p)
+        if im is None:
             continue
-        h0, w0 = img.shape[:2]
-        boxes, scores = _detect(model, img, conf=conf)
-
-        roi = get_roi(cam_id_from_filename(p)) if use_roi else None
-        if roi is not None:
-            boxes, scores = filter_by_roi(boxes, scores, roi, w0, h0)
-
-        stem = Path(p).stem
-        shutil.copy2(p, out / "images" / f"{stem}.jpg")
-        lines = _to_yolo_lines(boxes, w0, h0)
-        (out / "labels" / f"{stem}.txt").write_text("\n".join(lines))
-
+        h, w = im.shape[:2]
+        res = get_sliced_prediction(
+            p, model, slice_height=slice_size, slice_width=slice_size,
+            overlap_height_ratio=overlap, overlap_width_ratio=overlap,
+            verbose=0)
+        lines, pv = [], (im.copy() if preview else None)
+        for o in res.object_prediction_list:
+            if o.category.id not in VEHICLE_COCO_IDS:
+                continue
+            x1, y1, x2, y2 = o.bbox.to_xyxy()
+            cx, cy = (x1 + x2) / 2 / w, (y1 + y2) / 2 / h
+            bw, bh = (x2 - x1) / w, (y2 - y1) / h
+            lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            if preview:
+                cv2.rectangle(pv, (int(x1), int(y1)), (int(x2), int(y2)),
+                              (0, 128, 255), 1)
+        name = Path(p).name
+        shutil.copy(p, img_dir / name)
+        (lbl_dir / (Path(p).stem + ".txt")).write_text("\n".join(lines))
         if preview:
-            prev = draw(img, boxes, scores)
-            if roi is not None:
-                prev = draw_roi(prev, roi)
-            cv2.imwrite(str(out / "preview" / f"{stem}.jpg"), prev)
+            cv2.imwrite(str(pv_dir / name), pv)
+        n_boxes += len(lines)
+        n_empty += (len(lines) == 0)
+        if i % 50 == 0 or i == len(paths):
+            print(f"  {i}/{len(paths)}  累計框 {n_boxes}")
 
-        n_boxes += len(boxes)
-        n_empty += int(len(boxes) == 0)
+    yaml = (f"path: {out_root}\ntrain: images\nval: images\n"
+            f"nc: 1\nnames: ['Vehicle']\n")
+    (out / "data.yaml").write_text(yaml)
 
-    _write_data_yaml(out)
-    return {"n_images": len(image_paths), "n_boxes": n_boxes, "n_empty": n_empty}
-
-
-def _write_data_yaml(out: Path) -> None:
-    """寫 ultralytics fine-tune 用的 data.yaml。"""
-    names = "\n".join(f"  {i}: {c}" for i, c in enumerate(CLASSES))
-    (out / "data.yaml").write_text(
-        f"path: {out}\ntrain: images\nval: images\n\n"
-        f"nc: {len(CLASSES)}\nnames:\n{names}\n")
+    stats = {"n_images": len(paths), "n_boxes": n_boxes, "n_empty": n_empty}
+    print(f"\n=== 自動標籤完成 ===\n  影像 {stats['n_images']} 張"
+          f"／總框 {stats['n_boxes']}（平均 {n_boxes/max(1,len(paths)):.1f}/張）"
+          f"／零框 {stats['n_empty']} 張\n  輸出 {out_root}")
+    return stats

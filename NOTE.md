@@ -548,3 +548,62 @@ docker compose exec -d ray-head python scripts/monitor.py   # http://localhost:8
 > **Accident 突破**：原本對台灣畫面無鑑別力（真事故與正常 P(accident) 都 ~0.88 重疊）。
 > 改用合成台灣車禍正樣本 + Ray Tune 搜超參（自動避開崩潰的高 lr），真車禍片段 0.50 vs
 > 正常 0.20（C-B +0.295）。部署再以靜止車輛偵測為主、分類器為輔，兩者互補。
+
+---
+
+## 附錄 Z：重新規劃 — 事故改用真實軌跡時序模型（2026-06-07）
+
+舊系統（上方各章）的事故是「整幅 YOLO11n-cls 影像分類 + 合成台灣車禍」，鑑別力有
+天花板。本次**整個事故案重新規劃**：改為**軌跡時序模型**，並把車流、車禍各自做成
+完整的 Ray 四階段兩條流程。車流（freeway yolo11s，mAP50 0.847）保留沿用。
+
+### Z.1 事故資料集評選（踩雷紀錄）
+
+| 資料集 | 真事故 | 可偵測 | domain | 可下載 | 結論 |
+|---|---|---|---|---|---|
+| UCF-Crime RoadAccidents | ✅ | ❌ 夜街/糊，事故幀偵測 0 台車 | 偏 | ✅ | 棄（追蹤抽不出軌跡）|
+| CADP | ✅ | — | — | ✅ 但標註座標與影片版本錯位 | 棄 |
+| TUMTraf-A | ✅✅ | ✅ | ✅ 路側高速公路 | ❌ **未釋出** | 看得到吃不到 |
+| DETRAC / TUMTraf-A9 | ❌ 純正常車流 | ✅✅ | ✅ | ✅ | 只能當負樣本 |
+| **AccidentBench** | ✅ | **✅ 實測 15/15 可追蹤** | ✅ 路側 CCTV | ✅ | **採用** |
+
+- **AccidentBench**：2027 支真實事故影片 + metadata（事故幀/事故框/型態/場景/晝夜/畫質）。
+  篩 `highway+day+畫質OK` = **271 支**對齊高公局。使用者明確要求**不用合成資料** →
+  只用真實 split。
+- 教訓：「真實事故 + 可偵測 + domain 對 + 可下載」四者同時滿足的資料極稀缺，繞了五個
+  資料集才收斂。
+
+### Z.2 軌跡時序模型設計
+
+- **不吃像素，吃運動數字**：YOLO+ByteTrack → 每台車 10 維運動特徵（速度/加速度/航向變化/
+  最近車距/停滯…），座標正規化（解析度無關）。→ 與偵測器/domain 解耦，部署換高公局
+  yolo11s 即可遷移。
+- **fps 對齊**：實測高公局 `cctvn.freeway.gov.tw` MJPEG ~9–11fps（[grabber](src/data/freeway/grabber.py)
+  的串流）。訓練把 AccidentBench 30fps 降採樣到等效 10fps，速度尺度才一致。
+- **正樣本去雜訊**：以「事故時刻與事故框 IoU 最高的軌跡」鎖定肇事車（碰撞取前 2 台），
+  只標肇事車 ±1s（[label.py](src/data/accident/label.py) `identify_culprits`），避免正常過路車
+  被誤標 —— 首版用「框內任何車±1s」標籤雜訊太大，窗級 AP 僅 0.036。
+- **不平衡**：正樣本約 1% → `pos_weight` + AP 指標 + 依正樣本數分層切分；評估加**事件級**
+  （每片是否在事故時刻被觸發 + 背景誤報率，[eval_accident.py](scripts/eval_accident.py)）。
+
+### Z.3 Ray 四階段 + 節點配置
+
+- ① Ray Data：271 片 yolo11x+ByteTrack 追蹤（GPU 序列，concurrency=1），輸出 ~6 萬時序樣本。
+- ② Ray Tune：時序模型小 → **每試驗 2 CPU、head+2 worker 三節點平行**（實測 16/16 CPU
+  全滿、worker 各 200%+ CPU）。這是兩個 CPU-only worker **唯一真正吃滿**的場景 —— GPU 綁定
+  的 freeway 用不到 worker，小巧時序模型的 CPU 平行搜參才讓三節點名副其實。
+- ③ Ray Train：TorchTrainer 用最佳超參（GRU h128 l2）訓練，checkpoint 自帶 scaler。
+
+### Z.4 RAY MONITOR：Pipeline 拆兩條
+
+[state.py](src/monitor/state.py) `pipeline_state()` 改回傳 `{pipelines:[車流, 車禍]}`：車流偵測到
+模型已存在 → 標 ①②③ 完成、④ 可上線；車禍依 `accident_seq/train.npz`、`accident_final/
+accident_seq.pt` 是否存在 + 執行中 job 即時亮階段。`_active_job` 區分 `*_freeway` vs
+`*_accident`，Tune log 依案別讀對應來源（freeway→ultralytics、accident→Ray Tune，解析 AP/recall/f1）。
+
+### Z.5 現況
+
+- 車流：✅ 完成可上線（mAP50 0.847）。
+- 車禍：四階段已端到端跑通，輕量測試模型已產出；正以「收緊正樣本 + 事件級評估」提升
+  鑑別力。架構與資料無關，未來換真高公局事故/擴大資料不需改架構。
+- Serve 整合車禍時序模型（含連續高 fps 抓幀）為後續工作。

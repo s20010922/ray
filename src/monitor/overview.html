@@ -93,14 +93,16 @@ header{display:flex;align-items:center;justify-content:space-between;
 .cdoing{font-size:14.5px;color:var(--tp);margin-top:14px;font-weight:600;flex-shrink:0;
   display:flex;align-items:center;gap:10px;min-height:22px}
 .clog{flex:1;margin-top:12px;min-height:90px;background:#080e1a;
-  border:1px solid rgba(34,211,255,.1);border-radius:8px;padding:9px 11px;
+  border:1px solid rgba(34,211,255,.1);border-radius:8px;padding:9px 13px 12px;
+  box-sizing:border-box;overflow-x:hidden;
   font-family:var(--mono);font-size:12px;line-height:1.7;overflow-y:auto;
   display:flex;flex-direction:column;gap:1px}
 .clog::-webkit-scrollbar{width:7px}
 .clog::-webkit-scrollbar-thumb{background:rgba(34,211,255,.25);border-radius:4px}
 .clog .llbl{font-size:9.5px;letter-spacing:1.5px;color:var(--tm);margin-bottom:4px;
   text-transform:uppercase;position:sticky;top:0;background:#080e1a;padding-bottom:2px;flex-shrink:0}
-.clog .ll{color:var(--ts);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
+.clog .ll{color:var(--ts);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  flex-shrink:0;min-width:0;max-width:100%;padding-right:3px;box-sizing:border-box}
 .clog .ll:last-child{color:var(--ng)}
 .clog .empty{color:var(--tm);font-style:italic;font-size:11px}
 .cdesc{font-size:12px;color:var(--ts);margin-top:12px;padding-top:12px;line-height:1.55;flex-shrink:0;
@@ -128,6 +130,20 @@ header{display:flex;align-items:center;justify-content:space-between;
   color:#052012;background:var(--ng);box-shadow:0 0 26px rgba(45,255,160,.55);
   font-size:16px;letter-spacing:1px;animation:p 1.6s infinite}
 .finish small{display:block;font-size:11px;font-weight:600;color:#0a3a22;margin-top:4px;letter-spacing:.5px}
+/* 兩條流程：群組標題 + 徽章 + 可上線狀態 */
+.pgroup{margin-bottom:14px}
+.pgroup+.pgroup{padding-top:14px;border-top:1px dashed rgba(34,211,255,.18)}
+.pname{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:800;
+  color:var(--tp);letter-spacing:.5px;margin:0 0 10px 2px}
+.pbadge{font-family:var(--mono);font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px;letter-spacing:.5px}
+.pbadge.ok{color:#052012;background:var(--ng)}
+.pbadge.rdy{color:#052012;background:var(--tp)}
+.pbadge.run{color:#052012;background:var(--ng);animation:p 1.3s infinite}
+.pbadge.idle{color:var(--tm);border:1px solid var(--line)}
+.pstep.ready .pnum{color:#052012;background:var(--tp);border-color:var(--tp)}
+.pstep.ready .pmain{color:var(--tp)}
+.pstep.ready .psub{color:var(--tp)}
+.pstep.ready:not(.last)::before{background:rgba(34,211,255,.4)}
 </style>
 </head>
 <body>
@@ -163,19 +179,19 @@ header{display:flex;align-items:center;justify-content:space-between;
       <span class="dot ok"></span>
     </div>
     <div class="comp">
-      <div class="citem" id="c-data"><div class="crow"><div class="cname">Ray Data</div><div class="cstate idle" id="s-data">IDLE</div></div>
+      <div class="citem" id="c-data"><div class="crow"><div class="cname">① Ray Data</div><div class="cstate idle" id="s-data">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-data"></span><span id="doing-data">–</span></div>
         <div class="clog" id="log-data"><div class="empty">—</div></div>
-        <div class="cdesc" id="desc-data">串流資料管線</div></div>
-      <div class="citem" id="c-train"><div class="crow"><div class="cname">Ray Train</div><div class="cstate idle" id="s-train">IDLE</div></div>
-        <div class="cdoing"><span class="dot idle" id="d-train"></span><span id="doing-train">–</span></div>
-        <div class="clog" id="log-train"><div class="empty">—</div></div>
-        <div class="cdesc" id="desc-train">分散式訓練</div></div>
-      <div class="citem" id="c-tune"><div class="crow"><div class="cname">Ray Tune</div><div class="cstate idle" id="s-tune">IDLE</div></div>
+        <div class="cdesc" id="desc-data">資料前處理</div></div>
+      <div class="citem" id="c-tune"><div class="crow"><div class="cname">② Ray Tune</div><div class="cstate idle" id="s-tune">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-tune"></span><span id="doing-tune">–</span></div>
         <div class="clog" id="log-tune"><div class="empty">—</div></div>
         <div class="cdesc" id="desc-tune">超參搜尋</div></div>
-      <div class="citem" id="c-serve"><div class="crow"><div class="cname">Ray Serve</div><div class="cstate idle" id="s-serve">IDLE</div></div>
+      <div class="citem" id="c-train"><div class="crow"><div class="cname">③ Ray Train</div><div class="cstate idle" id="s-train">IDLE</div></div>
+        <div class="cdoing"><span class="dot idle" id="d-train"></span><span id="doing-train">–</span></div>
+        <div class="clog" id="log-train"><div class="empty">—</div></div>
+        <div class="cdesc" id="desc-train">分散式訓練</div></div>
+      <div class="citem" id="c-serve"><div class="crow"><div class="cname">④ Ray Serve</div><div class="cstate idle" id="s-serve">IDLE</div></div>
         <div class="cdoing"><span class="dot idle" id="d-serve"></span><span id="doing-serve">–</span></div>
         <div class="clog" id="log-serve"><div class="empty">—</div></div>
         <div class="cdesc" id="desc-serve">即時推論服務</div></div>
@@ -185,7 +201,7 @@ header{display:flex;align-items:center;justify-content:space-between;
   <!-- 右：Pipeline 流程 -->
   <div class="panel">
     <div class="ph">
-      <div class="pt">Pipeline<span class="zh">流程 · 目前階段</span></div>
+      <div class="pt">Pipeline<span class="zh">車流 · 車禍 兩條流程</span></div>
       <span class="dot" id="pdot"></span>
     </div>
     <div class="pipe" id="pipe"></div>
@@ -245,8 +261,7 @@ function setComp(key,c){
   const lines=(c.log||[]);
   // 有新 log 才更新；沒有就保留上次（不消失），並自動捲到最新
   if(lg && lines.length){
-    lg.innerHTML='<div class="llbl">recent log</div>'+
-      lines.map(l=>'<div class="ll">'+esc(l)+'</div>').join('');
+    lg.innerHTML=lines.map(l=>'<div class="ll">'+esc(l)+'</div>').join('');
     lg.scrollTop=lg.scrollHeight;
   }
 }
@@ -259,32 +274,38 @@ async function pollComponents(){
   }catch(e){}
 }
 
+const BADGE={done:['ok','完成'],ready:['rdy','可上線'],running:['run','執行中'],
+  partial:['idle','進行中'],idle:['idle','待開始']};
+function renderPipe(p){
+  const done=new Set(p.done||[]), cur=p.current, ready=p.ready, last=p.stages.length-1;
+  const steps=p.stages.map((s,i)=>{
+    const state=done.has(s.id)?'done':(s.id===cur?'cur':(s.id===ready?'ready':'todo'));
+    const sub={done:'完成',cur:'進行中…',ready:'可上線',todo:'待處理'}[state];
+    const num=state==='done'?'✓':(state==='ready'?'◆':(i+1));
+    return '<div class="pstep '+state+(i===last?' last':'')+'">'+
+      '<div class="pnum">'+num+'</div>'+
+      '<div class="ptxt"><div class="pmain">'+esc(s.label)+'</div>'+
+      '<div class="psub">'+sub+'</div></div></div>';
+  }).join('');
+  const b=BADGE[p.status]||BADGE.idle;
+  return '<div class="pgroup"><div class="pname">'+esc(p.name)+
+    '<span class="pbadge '+b[0]+'">'+b[1]+'</span></div>'+steps+'</div>';
+}
 async function pollPipeline(){
   try{
     const r=await fetch('/pipeline.json?_='+Date.now(),{signal:AbortSignal.timeout(6000)});
     if(!r.ok) throw 0;
     const d=await r.json();
-    const done=new Set(d.done||[]), cur=d.current, last=d.stages.length-1;
-    document.getElementById('pdot').className='dot '+(d.status==='done'?'ok':(cur?'ok':'idle'));
-    let html=d.stages.map((s,i)=>{
-      const state=done.has(s.id)?'done':(s.id===cur?'cur':'todo');
-      const isLast=i===last;
-      const sub=done.has(s.id)?'完成':(s.id===cur?'進行中…':'待處理');
-      return '<div class="pstep '+state+(isLast?' last':'')+'">'+
-        '<div class="pnum">'+(done.has(s.id)?'✓':(i+1))+'</div>'+
-        '<div class="ptxt"><div class="pmain">'+esc(s.label)+'</div>'+
-        '<div class="psub">'+sub+'</div></div></div>';
-    }).join('');
-    if(d.status==='done'){
-      html+='<div class="finish">✓ FINISH<small>全流程完成 · Serve 已上線</small></div>';
-    }
-    document.getElementById('pipe').innerHTML=html;
+    const pls=d.pipelines||[];
+    const anyRun=pls.some(p=>p.current);
+    document.getElementById('pdot').className='dot '+(anyRun?'ok':(pls.every(p=>p.status==='done'||p.status==='ready')?'ok':'idle'));
+    document.getElementById('pipe').innerHTML=pls.map(renderPipe).join('');
   }catch(e){}
 }
 
 pollCluster(); pollComponents(); pollPipeline();
 setInterval(pollCluster,2000);
-setInterval(pollComponents,2000);
+setInterval(pollComponents,1000);
 setInterval(pollPipeline,2000);
 </script>
 </body>

@@ -1,75 +1,69 @@
-"""車禍分類評估（held-out test set）。
+"""事故時序模型評估：窗級 AP + 事件級(每支影片)偵測率/誤報率。
 
-載入 Ray Train checkpoint，在完全隔離的 test set 上跑推論，
-印出 accuracy / precision / recall / F1 / confusion matrix。
+窗級 AP 在極不平衡下數字本來就低；對「事故偵測」真正有意義的是**事件級**：
+  - 影片偵測率(recall)：肇事片中，肇事區段最高分 ≥ 門檻 → 視為偵測到。
+  - 背景誤報率(FPR)：所有非事故窗中，分數 ≥ 門檻的比例(越低越好)。
+掃不同門檻，給出可讀的權衡;並報正/負樣本平均分數的分離度。
 
-  # 自動找最新 checkpoint，跑 test set
   docker compose exec ray-head python scripts/eval_accident.py
-
-  # 指定 checkpoint
-  docker compose exec ray-head python scripts/eval_accident.py \\
-      --checkpoint /workspace/ray_results/accident/TorchTrainer_xxx/checkpoint_000018/model.pt
 """
 
 import argparse
+from pathlib import Path
 
-import cv2
+import numpy as np
+import torch
 
-from src.data.accident.sources import list_accident_records
-from src.eval.accident import compute_cls_metrics
-from src.infer.accident import classify, find_best_accident_checkpoint, load_classifier
-from src.modeling.accident import CLASSES
+from src.modeling.accident import build_model
+from src.train.accident.trainer import average_precision
+
+CKPT = "/workspace/ray_results/accident_final/accident_seq.pt"
+DATA = "/workspace/datasets/accident_seq"
 
 
 def main():
-    ap = argparse.ArgumentParser(description="車禍分類評估（test set）")
-    ap.add_argument("--checkpoint", default=None,
-                    help="model.pt 路徑；省略則自動找最新 checkpoint")
-    ap.add_argument("--data-root", default="/workspace/datasets/accident",
-                    help="accident 資料根（含 test/ 子目錄）")
-    ap.add_argument("--device", default="cuda", help="cuda 或 cpu")
+    ap = argparse.ArgumentParser(description="事故模型評估(窗級+事件級)")
+    ap.add_argument("--ckpt", default=CKPT)
+    ap.add_argument("--data-dir", default=DATA)
+    ap.add_argument("--split", default="test")
     args = ap.parse_args()
 
-    ckpt = args.checkpoint or find_best_accident_checkpoint()
-    print(f"[載入] checkpoint: {ckpt}")
-    model, device = load_classifier(ckpt, device=args.device)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    mean, std = ck["scaler_mean"], ck["scaler_std"]
+    model = build_model(ck["config"], in_features=ck["in_features"])
+    model.load_state_dict(ck["state_dict"])
+    model.eval()
 
-    test_records = list_accident_records(args.data_root, split="test")
-    if not test_records:
-        print("[錯誤] test set 是空的。請先執行 src/data/accident/split.py 切出 test set。")
-        return
-    print(f"[資料] test set: {len(test_records)} 張")
+    d = np.load(Path(args.data_dir) / f"{args.split}.npz")
+    X = (d["X"].astype(np.float32) - mean) / std
+    y = d["y"].astype(np.int64)
+    clip = d["clip"]
+    with torch.no_grad():
+        s = torch.sigmoid(model(torch.from_numpy(X))).numpy()
 
-    y_true, y_pred = [], []
-    for rec in test_records:
-        img = cv2.imread(rec["image_path"])
-        if img is None:
-            continue
-        pred, _ = classify(model, img, device)
-        y_true.append(rec["label"])
-        y_pred.append(pred)
+    base = y.mean()
+    win_ap = average_precision(y.astype(np.float32), s)
+    print(f"=== {args.split} 集 ===")
+    print(f"樣本 {len(y)} | 正樣本 {int(y.sum())} ({100*base:.2f}%)")
+    print(f"\n[窗級] AP = {win_ap:.4f}  (隨機 {base:.4f} 的 {win_ap/max(base,1e-9):.1f} 倍)")
+    print(f"[分離度] 正樣本平均分 {s[y==1].mean():.3f} vs 負樣本 {s[y==0].mean():.3f}")
 
-    m = compute_cls_metrics(y_true, y_pred)
-
-    print("\n=== Accident 分類評估（Test Set）===")
-    print(f"  樣本數   : {len(y_true)}")
-    print(f"  Accuracy : {m['accuracy']:.4f}  ({m['accuracy']*100:.1f}%)")
-    print(f"  Macro F1 : {m['macro_f1']:.4f}")
-    print()
-    print(f"  {'類別':<16} {'Precision':>10} {'Recall':>8} {'F1':>8} {'Support':>8}")
-    print(f"  {'-'*52}")
-    for cls_name, s in m["per_class"].items():
-        print(f"  {cls_name:<16} {s['precision']:>10.4f} {s['recall']:>8.4f} "
-              f"{s['f1']:>8.4f} {s['support']:>8}")
-
-    print()
-    print("  Confusion Matrix (rows=真實, cols=預測):")
-    header = "  " + " " * 18 + "  ".join(f"{c[:8]:>8}" for c in CLASSES)
-    print(header)
-    for i, cls_name in enumerate(CLASSES):
-        row = "  " + f"{cls_name[:16]:<18}" + "  ".join(
-            f"{m['confusion_matrix'][i, j]:>8}" for j in range(len(CLASSES)))
-        print(row)
+    # 事件級：以 clip 為單位
+    acc_clips = sorted({int(c) for c in clip[y == 1]})      # 肇事片
+    print(f"\n[事件級] 測試集肇事片 {len(acc_clips)} 支")
+    print(f"{'門檻':>6} {'影片偵測率':>10} {'背景誤報率':>10} {'平均誤報/片':>10}")
+    neg_mask = y == 0
+    for th in (0.3, 0.5, 0.7, 0.8, 0.9, 0.95):
+        detected = 0
+        for c in acc_clips:
+            m = (clip == c) & (y == 1)
+            if s[m].max() >= th:
+                detected += 1
+        recall = detected / max(len(acc_clips), 1)
+        bg_fpr = (s[neg_mask] >= th).mean()
+        # 每支片平均有幾個背景窗誤觸發
+        fp_per_clip = (s[neg_mask] >= th).sum() / max(len(set(clip)), 1)
+        print(f"{th:>6} {recall:>9.1%} {bg_fpr:>10.3f} {fp_per_clip:>10.1f}")
 
 
 if __name__ == "__main__":

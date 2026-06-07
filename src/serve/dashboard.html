@@ -134,6 +134,27 @@ main{
 .bhd.ok{background:var(--ng);box-shadow:0 0 5px var(--ng)}
 .bhd.fail{background:#ff4060}
 
+/* accident demo panel */
+.adwrap{position:relative;flex:1;overflow:hidden;background:#000}
+.adwrap img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
+  display:block;image-rendering:auto;transition:opacity .15s}
+.adverdict{
+  position:absolute;top:9px;left:9px;z-index:6;padding:4px 13px;border-radius:5px;
+  font-family:var(--mono);font-size:15px;font-weight:800;letter-spacing:1px;
+  background:rgba(0,0,0,.72);border:1px solid currentColor;
+}
+.adverdict.acc{color:var(--nr);text-shadow:0 0 11px rgba(255,32,64,.6)}
+.adverdict.norm{color:var(--ng);text-shadow:0 0 10px rgba(0,255,136,.5)}
+.adtruth{
+  position:absolute;bottom:0;left:0;right:0;z-index:6;
+  padding:16px 11px 8px;font-family:var(--mono);font-size:12.5px;font-weight:700;
+  color:var(--tp);background:linear-gradient(0deg,rgba(0,0,0,.88) 0%,transparent 100%);
+  display:flex;align-items:center;justify-content:space-between;
+}
+.adtag{padding:2px 9px;border-radius:4px;font-size:11px;font-weight:800;letter-spacing:.5px}
+.adtag.ok{color:#04210f;background:var(--ng)}
+.adtag.bad{color:#fff;background:var(--nr)}
+
 /* log */
 .log{
   flex:1;overflow-y:auto;padding:8px 11px;
@@ -187,19 +208,17 @@ main{
 <main id="grid">
   <!-- camera cards injected by JS -->
 
-  <!-- BRAIN PANEL (slot 6) -->
+  <!-- ACCIDENT DEMO PANEL (slot 6) -->
   <div class="brain" id="brain">
     <div class="bh">
-      <div class="btitle">&#9672; EVENT LOG &middot; &#20840;&#22495;&#20107;&#20214;</div>
+      <div class="btitle">&#9672; 車禍偵測 &middot; ACCIDENT AI</div>
       <div class="bhealthrow">
-        <div class="bhi"><div class="bhd" id="bht"></div>TRF</div>
+        <div class="bhi"><div class="bhd" id="bht"></div>CNN</div>
       </div>
     </div>
-    <div class="log" id="log"></div>
-    <div class="tbar">
-      <div class="tinfo">CYCLE <span id="tn">0000</span></div>
-      <div class="pbwrap"><div class="pbfill" id="pb" style="width:0%"></div></div>
-      <div class="tinfo">NEXT <span id="ns">4.0</span>s</div>
+    <div class="adwrap">
+      <img id="adImg" alt="">
+      <div class="adverdict" id="adVerdict">&mdash;</div>
     </div>
   </div>
 </main>
@@ -244,9 +263,9 @@ function buildCards() {
       '<div class="cc bl"></div><div class="cc br"></div>' +
       '<div class="c-top">' +
         '<div></div>' +
-        '<div class="c-badge" id="bdg-' + cam.id + '"><span class="bd"></span> WAIT</div>' +
+        '<div class="c-badge" id="bdg-' + cam.id + '"><span class="bd"></span> OFFLINE</div>' +
       '</div>' +
-      '<div class="c-log off" id="lg-' + cam.id + '">— 等待資料 —</div>';
+      '<div class="c-log off" id="lg-' + cam.id + '">— 離線 —</div>';
     grid.insertBefore(el, brain);
   });
 }
@@ -297,7 +316,6 @@ async function pollOnce() {
   S.tick++;
   const ts = String(S.tick).padStart(4, '0');
   document.getElementById('hTick').textContent = 'TICK ' + ts;
-  document.getElementById('tn').textContent = ts;
   cycleElapsed = 0;
 
   for (const cam of CFG.cameras) {
@@ -376,6 +394,45 @@ function tick() {
 }
 setInterval(tick, 1000); tick();
 
+// ─── ACCIDENT DEMO（右下角面板：輪播 test 集 + CNN 判定）──
+let adLastIdx = -1;
+function adSet(id, txt) { const e = document.getElementById(id); if (e) e.textContent = txt; }
+function adOffline() {
+  // 沒資料 / 後端離線：明確標 OFFLINE（不留殘影）
+  adLastIdx = -1;
+  const vd = document.getElementById('adVerdict');
+  if (vd) { vd.className = 'adverdict'; vd.textContent = '— OFFLINE —'; }
+  const bht = document.getElementById('bht'); if (bht) bht.className = 'bhd fail';
+}
+async function accidentDemoTick() {
+  let d;
+  try {
+    const r = await fetch('/accident_demo.json?_=' + Date.now(),
+      { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) { adOffline(); return; }
+    d = await r.json();
+  } catch { adOffline(); return; }
+
+  const bht = document.getElementById('bht'); if (bht) bht.className = 'bhd ok';
+
+  // 換幀才重載影像（依後端 idx 同步）
+  if (d.idx !== adLastIdx) {
+    adLastIdx = d.idx;
+    const img = document.getElementById('adImg');
+    if (img) img.src = '/accident_demo.jpg?_=' + Date.now();
+  }
+  // 模型「即時逐幀」判定徽章（紅=判事故 綠=判正常，不顯示 %）
+  const vd = document.getElementById('adVerdict');
+  if (vd) {
+    vd.className = 'adverdict ' + (d.pred ? 'acc' : 'norm');
+    vd.textContent = d.pred ? '⚠ 偵測到事故' : '✓ 正常';
+  }
+}
+function startAccidentDemo() {
+  accidentDemoTick();
+  setInterval(accidentDemoTick, 700);
+}
+
 // ─── INIT ────────────────────────────────────────
 buildCards();
 CFG.cameras.forEach(loadImg);
@@ -384,6 +441,7 @@ addLog('sys', 'SYSTEM', CFG.cameras.length + ' cams · poll ' + CFG.pollMs + 'ms
 checkHealth().then(() => addLog('sys', 'SYSTEM', 'Data server health check done'));
 setInterval(checkHealth, 30000);
 startPoll();
+startAccidentDemo();
 </script>
 </body>
 </html>

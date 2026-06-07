@@ -43,6 +43,111 @@ def _level(value: float, bands) -> str:
     return bands[-1][1]
 
 
+def _build_tad_demo(model_path: str, data_dir: str, frames_root: str,
+                    device: str, n_acc: int = 3, n_norm: int = 3,
+                    fpv: int = 40, thr: float = 0.5, disp_w: int = 480):
+    """B 方案：讀 TAD **測試影片**的原始幀，按時間播放、TAD 模型逐幀打分。
+
+    只取 test split 的影片（模型沒訓練過），事故/正常各幾支，交錯排。
+    回傳扁平的「逐幀」清單(已按影片→時間排序)，每筆：
+      {jpg, video, true, pred, prob, fpos, fn, vidx, vtotal}
+    顯示用原始畫面(縮到 disp_w 寬)，模型吃 224。檔案缺失回傳 []。
+    """
+    import json
+
+    import torch
+
+    from src.modeling.accident_cnn import build_model
+    from src.train.accident_cnn.trainer import IMAGENET_MEAN, IMAGENET_STD
+
+    try:
+        ck = torch.load(model_path, map_location=device, weights_only=False)
+        model = build_model(ck["config"]).to(device).eval()
+        model.load_state_dict(ck["state_dict"])
+        test_vids = set(np.load(Path(data_dir) / "test.npz")["vid"].tolist())
+        meta = json.loads((Path(data_dir) / "videos.json").read_text("utf-8"))
+    except (OSError, KeyError) as e:
+        print(f"[serve] 車禍展示停用（載入失敗）：{type(e).__name__}: {e}")
+        return []
+
+    def _frame_dir(name, label):
+        sub = "abnormal" if label == 1 else "normal"
+        return Path(frames_root) / sub / name
+
+    def _sel_frames(name, label):
+        fs = sorted(_frame_dir(name, label).glob("*.jpg"),
+                    key=lambda p: int(p.stem) if p.stem.isdigit() else 0)
+        if not fs:
+            return []
+        idx = np.linspace(0, len(fs) - 1, min(fpv, len(fs))).round().astype(int)
+        return [fs[i] for i in idx]
+
+    def _scores(paths):
+        out = []
+        for fp in paths:
+            bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+            if bgr is None:
+                out.append(0.0)
+                continue
+            sq = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), (224, 224),
+                            interpolation=cv2.INTER_AREA)
+            t = torch.from_numpy(sq).float().permute(2, 0, 1) / 255.0
+            t = ((t - IMAGENET_MEAN) / IMAGENET_STD).unsqueeze(0).to(device)
+            with torch.no_grad():
+                out.append(float(torch.sigmoid(model(t)).item()))
+        return np.array(out)
+
+    # ── 第一輪：對所有 test 影片打分，挑「會呈現時間反應」的片 ──
+    # 事故片挑 onset 最明顯者(前段低、後段高 → 出事才報，避免一開始就 100%)；
+    # 正常片挑全程分數最低者(最乾淨、不誤報)。
+    acc = sorted(meta[str(v)]["name"] for v in test_vids if meta[str(v)]["label"] == 1)
+    norm = sorted(meta[str(v)]["name"] for v in test_vids if meta[str(v)]["label"] == 0)
+    acc_cand, norm_cand = [], []
+    for name in acc:
+        paths = _sel_frames(name, 1)
+        if not paths:
+            continue
+        s = _scores(paths)
+        third = max(1, len(s) // 3)
+        onset = float(s[-third:].mean() - s[:third].mean())   # 後段-前段
+        acc_cand.append((onset, name, 1, paths, s))
+    for name in norm:
+        paths = _sel_frames(name, 0)
+        if not paths:
+            continue
+        s = _scores(paths)
+        norm_cand.append((float(s.mean()), name, 0, paths, s))
+
+    acc_cand.sort(key=lambda x: x[0], reverse=True)    # onset 大→小
+    norm_cand.sort(key=lambda x: x[0])                 # 平均分 低→高
+    picks = []
+    for i in range(max(n_acc, n_norm)):                # 事故/正常交錯
+        if i < n_acc and i < len(acc_cand):
+            picks.append(acc_cand[i])
+        if i < n_norm and i < len(norm_cand):
+            picks.append(norm_cand[i])
+
+    # ── 第二輪：對選中的片建顯示用 jpg + payload（分數沿用第一輪）──
+    playlist = []
+    for vidx, (_, name, label, paths, s) in enumerate(picks):
+        for fpos, (fp, prob) in enumerate(zip(paths, s)):
+            bgr = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+            if bgr is None:
+                continue
+            h, w = bgr.shape[:2]
+            disp = cv2.resize(bgr, (disp_w, round(h * disp_w / w)))
+            ok, enc = cv2.imencode(".jpg", disp)
+            playlist.append({
+                "jpg": enc.tobytes() if ok else b"",
+                "video": name, "true": label,
+                "pred": int(prob >= thr), "prob": float(prob),
+                "fpos": fpos + 1, "fn": len(paths),
+                "vidx": vidx + 1, "vtotal": len(picks),
+            })
+    print(f"[serve] TAD 影片展示就緒：{len(picks)} 片 / {len(playlist)} 幀")
+    return playlist
+
+
 @serve.deployment(ray_actor_options={"num_gpus": 1, "num_cpus": 2})
 @serve.ingress(app)
 class TrafficMonitor:
@@ -52,7 +157,13 @@ class TrafficMonitor:
                  poll_interval: float = 4.0,
                  conf: float = 0.4,
                  imgsz: int = 640,
-                 device: str = "cuda"):
+                 device: str = "cuda",
+                 accident_model: str =
+                 "/workspace/ray_results/accident_tad_final/accident_tad.pt",
+                 tad_data_dir: str = "/workspace/datasets/accident_tad_seq",
+                 tad_frames_root: str =
+                 "/workspace/datasets/Traffic Anomaly Dataset/TAD/frames",
+                 demo_interval: float = 2.0):   # 與 traffic 輪詢(pollMs 2000)對齊
         from ultralytics import YOLO
 
         self.poll_interval = poll_interval
@@ -62,6 +173,11 @@ class TrafficMonitor:
 
         # 車流偵測：freeway best.pt 是 ultralytics 原生格式，直接 YOLO 載
         self.detector = YOLO(detector_weights)
+
+        # 車禍偵測展示：TAD 測試影片逐幀播放 + TAD 模型即時判定（右下角面板）
+        self.demo_interval = demo_interval
+        self.accident_demo = _build_tad_demo(
+            accident_model, tad_data_dir, tad_frames_root, device)
 
         # 每鏡頭快取：最新標註 jpg bytes + json dict
         self.cache: Dict[str, dict] = {}
@@ -145,6 +261,31 @@ class TrafficMonitor:
                             headers={"Cache-Control": "no-cache"})
         return JSONResponse(entry["json"],
                             headers={"Cache-Control": "no-cache"})
+
+    # ── 車禍偵測展示（右下角面板）：TAD 測試影片逐幀播放 ──
+    def _demo_index(self) -> int:
+        n = len(self.accident_demo)
+        if n == 0:
+            return -1
+        return int(time.time() / self.demo_interval) % n
+
+    @app.get("/accident_demo.{ext}")
+    def accident_demo(self, ext: str):
+        idx = self._demo_index()
+        if idx < 0:
+            return JSONResponse({"error": "demo unavailable"}, status_code=503)
+        item = self.accident_demo[idx]
+        if ext == "jpg":
+            return Response(item["jpg"], media_type="image/jpeg",
+                            headers={"Cache-Control": "no-cache"})
+        return JSONResponse({
+            "idx": idx,
+            "video": item["video"], "true": item["true"],
+            "pred": item["pred"], "prob": round(item["prob"], 4),
+            "fpos": item["fpos"], "fn": item["fn"],
+            "vidx": item["vidx"], "vtotal": item["vtotal"],
+            "interval": self.demo_interval,
+        }, headers={"Cache-Control": "no-cache"})
 
 
 def build_app(args: dict = None):

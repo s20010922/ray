@@ -170,6 +170,25 @@ def _recent_metrics(experiments, limit=12, base="/workspace/ray_results"):
     return out
 
 
+def _bar(pct, width=16):
+    """文字進度條，如 ██████░░░░░░░░░░。"""
+    fill = int(round(width * pct / 100))
+    return "█" * fill + "░" * (width - fill)
+
+
+def _data_progress(parts="/workspace/datasets/accident_seq/_parts"):
+    """事故 Ray Data 進度 (done, total, pct)；無進行中則 None。"""
+    try:
+        tp = os.path.join(parts, "_total.txt")
+        if not os.path.exists(tp):
+            return None
+        total = int(open(tp, encoding="utf-8").read().strip())
+        done = sum(1 for f in os.listdir(parts) if f.endswith(".npz"))
+        return done, total, (round(100 * done / total) if total else 0)
+    except Exception:
+        return None
+
+
 _PIPE_STATE_FILE = "/workspace/ray_results/_pipeline_state.json"
 
 # Ray 標準四階段流程（freeway：Ray Data → Tune → Train → Serve）
@@ -213,19 +232,34 @@ def pipeline_state():
         traffic.update(current=cur_stage, ready=None, status="running",
                        done=ids[:ids.index(cur_stage)])
 
-    # ── 車禍（Accident）：依產物與執行中任務推斷 ──
+    # ── 車禍（Accident）：依產物與執行中任務推斷（涵蓋 TAD / CNN / 軌跡）──
+    acc_data = any(_exists(p) for p in (
+        "/workspace/datasets/accident_tad_seq/train.npz",
+        "/workspace/datasets/accident_cnn_seq/train.npz",
+        "/workspace/datasets/accident_seq/train.npz"))
+    acc_model = any(_exists(p) for p in (
+        "/workspace/ray_results/accident_tad_final/accident_tad.pt",
+        "/workspace/ray_results/accident_cnn_final/accident_cnn.pt",
+        "/workspace/ray_results/accident_final/accident_seq.pt"))
     acc_done = []
-    if _exists("/workspace/datasets/accident_seq/train.npz"):
+    if acc_data:
         acc_done.append("prepare")
-    if _exists("/workspace/ray_results/accident_final/accident_seq.pt"):
+    if acc_model:
         acc_done = ["prepare", "tune", "train"]
+    # 事故模型部署在 serve replica（右下角 TAD 影片 demo）→ serve 上線
+    acc_serve = _serve_alive() and acc_model
+
     acc_cur, acc_ready, acc_status = None, None, "idle"
     if case == "accident" and cur_stage:
         acc_cur = cur_stage
         acc_done = ids[:ids.index(cur_stage)]
         acc_status = "running"
-    elif "train" in acc_done:
+    elif acc_serve:
+        acc_done = ["prepare", "tune", "train", "serve"]
         acc_status = "done"
+    elif "train" in acc_done:
+        acc_ready = "serve"             # 訓練完成、待上線
+        acc_status = "ready"
     elif acc_done:
         acc_status = "partial"
     accident = {"name": "車禍偵測（Accident）", "stages": stages,
@@ -369,19 +403,29 @@ def components_state():
                 "log": log or []}
 
     data_log = _data_log_rolling(data_ops)          # 滾動歷史（時間戳 + 運算元）
+    prog = _data_progress()                          # 事故 Ray Data 進度 %
+    if prog:
+        done, total, pct = prog
+        data_log = [f"進度 {done}/{total} 支　{pct}%　{_bar(pct)}"] + data_log
     # 依案別選 log 來源：事故走 Ray Tune/Train（ray_results）；freeway 走 ultralytics
     if case == "accident":
-        tune_log = _recent_metrics(["accident_tune"])
-        train_log = _recent_metrics(["accident_final_raytrain", "accident_final"])
+        # 涵蓋 TAD 主線、圖片集 CNN、軌跡對照；取 mtime 最新的 run（正在跑的會顯示）
+        tune_log = _recent_metrics(
+            ["accident_tad_tune", "accident_cnn_tune", "accident_tune"])
+        train_log = _recent_metrics(
+            ["accident_tad_final_raytrain", "accident_tad_final",
+             "accident_cnn_final_raytrain", "accident_cnn_final",
+             "accident_final_raytrain", "accident_final"])
     else:
         tune_log = _recent_metrics(["tune*"], base="/workspace/runs/detect")
         train_log = _recent_metrics(["freeway_final_raytrain", "freeway_final"])
 
     return {
         "data": comp(
-            data_tasks > 0,
-            f"處理中 {data_tasks} 個 batch task{tag}" if data_tasks
-            else "閒置（等待前處理）",
+            data_tasks > 0 or prog is not None,
+            (f"追蹤中 {prog[0]}/{prog[1]} 支（{prog[2]}%）{tag}" if prog
+             else f"處理中 {data_tasks} 個 batch task{tag}" if data_tasks
+             else "閒置（等待前處理）"),
             "把資料分成 訓練／驗證／測試 三份",
             data_log),
         "tune": comp(

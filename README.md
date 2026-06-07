@@ -31,20 +31,21 @@
 
 | 流程 | 模型 | 型態 | 訓練資料 | 狀態 |
 |------|------|------|----------|------|
-| **車流偵測**（Freeway） | YOLO11s | 物件偵測（車輛） | 高公局 CCTV 自動標註（SAHI + yolo11x teacher） | ✅ 訓練完成，可上線 |
-| **車禍偵測**（Accident） | LSTM／GRU／1D-CNN | 軌跡時序分類 | AccidentBench 真實高速公路事故影片 | 🔄 流程已跑通，模型優化中 |
+| **車流偵測**（Freeway） | YOLO11s | 物件偵測（車輛） | 高公局 CCTV 自動標註（SAHI + yolo11x teacher） | ✅ 訓練完成、已上線 |
+| **車禍偵測**（Accident） | MobileNetV2 | 逐幀二分類 | **TAD**（高速公路監控真實事故，影片級切分） | ✅ 訓練完成、已上線 |
 
-兩者**共用同一個偵測前端**（YOLO 偵測 + ByteTrack 追蹤），再分流：一邊算車流計數／
-密度，一邊把軌跡轉成運動特徵餵時序模型判斷事故。
+> **車禍模型演進**：曾試「軌跡時序（AccidentBench）」與「圖片 CNN（Road Accidents）」兩條,
+> 前者訊號太弱、後者疑似資料洩漏(99% 假象);最終採 **TAD**（freeway 監控同域 + 影片級切分），
+> 得到誠實的影片級 **ROC-AUC 0.92**。舊兩條已封存於 `_archive/`,評選見 [report.md](report.md) §2.3。
 
 ### 1.2 Ray 技術堆疊
 
-| 元件 | 車流（Freeway） | 車禍（Accident） |
+| 元件 | 車流（Freeway） | 車禍（Accident，TAD） |
 |------|------|------|
-| **Ray Data** | 影像切分／前處理（CPU 多節點） | yolo11x+ByteTrack 追蹤抽軌跡（GPU 序列） |
-| **Ray Tune** | ASHA 搜偵測超參（ultralytics，GPU） | ASHA 搜時序超參（**CPU 三節點平行**） |
-| **Ray Train** | TorchTrainer 編排 yolo11s 訓練（GPU） | TorchTrainer 訓練時序模型（GPU/CPU） |
-| **Ray Serve** | 多鏡頭即時偵測儀表板（:8000） | 接在偵測前端後的時序判斷（規劃中） |
+| **Ray Data** | 影像切分／前處理（CPU 多節點） | **影片級切分**(防洩漏) + 解碼縮放（CPU 多節點） |
+| **Ray Tune** | ASHA 搜偵測超參（ultralytics，GPU） | ASHA 搜 CNN 超參（GPU 分數共享；資料經 `ray.put` 物件存儲共享）|
+| **Ray Train** | TorchTrainer 編排 yolo11s 訓練（GPU） | TorchTrainer 微調 MobileNetV2（GPU）|
+| **Ray Serve** | 多鏡頭即時偵測儀表板（:8000） | 同 replica：右下角 TAD 測試影片逐幀判定展示 |
 
 > **獨立的 RAY MONITOR**（[scripts/monitor.py](scripts/monitor.py)）以輕量 driver 連上叢集，
 > 純觀察各 Ray 元件活動與節點負載，**不依賴 Serve、不佔 GPU**，叢集一啟動即可看，
@@ -54,26 +55,22 @@
 
 ## 2. 兩條流程的設計
 
-### 2.1 核心理念：偵測器可換、時序模型不變
+### 2.1 車流：偵測 + 密度分級
 
-車禍時序模型**只吃抽象運動數字**（速度／加速度／航向變化／最近車距／停滯…），
-**不吃像素**。像素層的差異（畫質、角度、解析度）在「偵測＋追蹤」那關就被吸收，
-流到時序模型的只剩運動特徵：
+高公局自身 CCTV 訓練 yolo11s 單類車輛偵測器,即時抓幀 → 偵測 → 依車輛數/佔用面積
+分「LOW/MED/HIGH」密度等級,呈現在儀表板。
 
-```
-AccidentBench 影片 ──YOLO(yolo11x)──┐
-                                    ├─► [速度,加速度,車距,…] ─► 同一個時序模型
-高公局 CCTV        ──YOLO(11s)──────┘
-```
+### 2.2 車禍：同域資料 + 影片級切分（防洩漏）
 
-因此**用 AccidentBench 訓練的時序模型，能直接吃高公局的軌跡** —— 部署時只要把前端
-偵測器換成高公局自己的 yolo11s，運動特徵的「數字長相」一致即可遷移。
+採 **TAD** 高速公路監控真實事故,**MobileNetV2 逐幀二分類**(事故/正常)。關鍵設計:
 
-### 2.2 幀率對齊
+- **同域**:TAD 是 freeway 監控視角,與高公局同類,跨域風險最低。
+- **影片級切分**:以「影片」為單位切 train/val/test,同一支影片的幀**不跨 split**——
+  這是數字可信的核心(隨機切幀會把同片相鄰幀同時放進 train/test → 洩漏灌水)。
+- **粗標籤限制**:TAD 無逐幀事故時刻,整片標同一類 → 模型擅長「判斷該片是否事故」
+  (影片級 ROC 0.92),但**無法精準定位撞擊瞬間**(已知限制)。
 
-高公局 `cctvn.freeway.gov.tw` 的 MJPEG 串流實測約 **9–11 fps**。訓練時把 AccidentBench
-（多為 30fps）依各片 fps 動態降採樣到**等效 10fps**，讓速度／加速度的數值尺度與部署
-一致（[pipeline.py](src/data/accident/pipeline.py) 的 `target_fps`）。
+> 詳細評估與資料集評選(軌跡法/圖片 CNN/TAD 三條對照)見 [report.md](report.md)。
 
 ---
 
@@ -91,18 +88,22 @@ AccidentBench 影片 ──YOLO(yolo11x)──┐
 容器映像（[Dockerfile](Dockerfile)）：CUDA + Python 3.10 + Ray + Ultralytics + PyTorch +
 OpenCV（完整見 [requirements.txt](requirements.txt)）。
 
-> ByteTrack 追蹤需 `lap`/`lapx`；離線環境可在 head 容器內以 wheel 安裝
-> （`pip install --no-index <lapx wheel>`）。
+> 容器無對外網路；torchvision 預訓練權重（MobileNetV2/ResNet18）與 yolo11x 皆於 host
+> 預先下載並放 `datasets/weights/`，程式以本地檔載入（`weights=None` + `load_state_dict`）。
 
 ### 3.3 資料掛載（[docker-compose.yml](docker-compose.yml)）
 
 | 主機路徑 | 容器路徑 | 權限 | 用途 |
 |----------|----------|------|------|
-| `./ACCIDENT` | `/data/accident` | 唯讀 | AccidentBench 真實事故影片 + metadata |
-| `./datasets` | `/workspace/datasets` | 可寫 | 轉檔資料、權重、時序資料集 |
+| `F:/dataset` | `/data/detrac` | 唯讀 | UA-DETRAC 車輛偵測原始資料 |
+| `F:/DoTA` | `/data/dota` | 唯讀 | DoTA 事故資料（保留）|
+| `./datasets` | `/workspace/datasets` | 可寫 | 轉檔資料、權重、**TAD frames**、處理後 npz |
 | `./src` | `/workspace/src` | 唯讀 | 原始碼 |
 | `./scripts` | `/workspace/scripts` | 唯讀 | 進入點腳本 |
 | `./ray_results` | `/workspace/ray_results` | 可寫 | 訓練／搜參輸出 |
+
+> TAD 資料放在 `./datasets/Traffic Anomaly Dataset/TAD/frames`,故沿用 `./datasets` 掛載,
+> 不需另開掛載。舊的 `ACCIDENT`／`Road Accidents` 掛載已隨軌跡/圖片集封存而移除。
 
 ### 3.4 對外連接埠
 
@@ -127,13 +128,12 @@ docker compose exec -d ray-head python scripts/monitor.py
 # 3. 車流流程（Freeway）— 已訓練完成的模型在 ray_results/freeway_final/
 #    （如需重跑，見 §5）
 
-# 4. 車禍流程（Accident）— 三階段
-docker compose exec ray-head python scripts/prepare_accident.py        # ① Ray Data
-docker compose exec ray-head python scripts/tune_accident.py --samples 24   # ② Ray Tune（CPU 三節點）
-docker compose exec ray-head python scripts/train_accident.py --kind gru --hidden 128 --layers 2  # ③ Ray Train
-docker compose exec ray-head python scripts/eval_accident.py           # 評估（窗級 + 事件級）
+# 4. 車禍流程（Accident，TAD）— 三階段（TAD frames 置於 datasets/Traffic Anomaly Dataset/）
+docker compose exec ray-head python scripts/prepare_accident_tad.py    # ① Ray Data（影片級切分）
+docker compose exec ray-head python scripts/eval_accident_tad.py       # 評估（影片級 + 幀級）
+#    ② Tune / ③ Train 完整指令見 §11
 
-# 5. 車流即時儀表板（佔 GPU）
+# 5. 即時儀表板（5 路車流 + 右下角車禍影片 demo，佔 GPU）
 docker compose exec -d ray-head python scripts/serve_dashboard.py
 #    瀏覽器：http://localhost:8000/
 
@@ -164,71 +164,62 @@ docker compose down   # 關閉叢集
 
 ## 6. 車禍偵測流程（Accident）
 
-軌跡時序模型，資料來源為 **AccidentBench** 真實高速公路事故影片。
+逐幀二分類 CNN，資料來源為 **TAD**（Traffic Anomaly Dataset，高速公路監控真實事故）。
 
 ### 6.1 資料來源與篩選
 
-AccidentBench（`/data/accident`）含 2027 支真實事故影片 + 豐富 metadata（事故幀、事故框
-`x1y1x2y2`、事故型態、場景、晝夜、畫質）。以 metadata 篩出**對齊高公局**的子集：
-`scene_layout=highway` ＋ `day_time=day` ＋ 畫質非最差 → **271 支**乾淨可偵測影片。
+TAD `frames/` 下 `normal/`（250 片）與 `abnormal/`（260 片，分 7 種異常）。**純車禍偵測**
+只取 `abnormal/01_Accident_*`（110 片）為正類、`normal`（250 片）為負類,其餘 5 種異常排除。
+畫面 720×300 監控俯視,與高公局同域。
 
 ### 6.2 四階段
 
 | 階段 | 腳本／模組 | 說明 |
 |------|------|------|
-| ① Ray Data | [prepare_accident.py](scripts/prepare_accident.py)<br>[data/accident/](src/data/accident/) | 每片 yolo11x+ByteTrack 追蹤 → 運動特徵 → 滑動視窗。GPU 序列執行，輸出 `datasets/accident_seq/{train,val,test}.npz` |
-| ② Ray Tune | [tune_accident.py](scripts/tune_accident.py) | ASHA 搜 LSTM/GRU/CNN × hidden/layers/lr/dropout。**每試驗 2 CPU → head+2 worker 平行** |
-| ③ Ray Train | [train_accident.py](scripts/train_accident.py) | `TorchTrainer` 用最佳超參正式訓練，輸出自帶 scaler 的 checkpoint |
-| 評估 | [eval_accident.py](scripts/eval_accident.py) | **窗級 AP + 事件級**（每片是否在事故時刻被觸發、背景誤報率）|
+| ① Ray Data | [prepare_accident_tad.py](scripts/prepare_accident_tad.py)<br>[data/accident_tad/](src/data/accident_tad/) | **影片級分層切分**(同片不跨 split) + 每片均勻抽 60 幀 → 解碼縮 224。輸出 `datasets/accident_tad_seq/{train,val,test}.npz`（含 `vid` 供影片級評估）|
+| ② Ray Tune | [tune_accident_cnn.py](scripts/tune_accident_cnn.py) | ASHA 搜 backbone/freeze/lr/dropout/aug。資料 `ray.put` 進**物件存儲共享**,多 trial 零拷貝 |
+| ③ Ray Train | [train_accident_cnn.py](scripts/train_accident_cnn.py) | `TorchTrainer` 微調 MobileNetV2,選優看 **val F1**,輸出 `accident_tad_final/accident_tad.pt` |
+| 評估 | [eval_accident_tad.py](scripts/eval_accident_tad.py) | **影片級（主）** ROC/PR-AUC + 幀級 |
 
-### 6.3 特徵工程（[features.py](src/data/accident/features.py)）
+### 6.3 模型與不平衡處理
 
-每台車逐幀算 10 維運動特徵：速率、速度分量、加速度、航向角變化、框面積與變化率、
-最近他車距離與變化、停滯旗標。座標一律以畫面寬高**正規化**（解析度無關），位置只用於
-打標、不進特徵矩陣（維持 domain 不變）。
+- **模型**（[modeling/accident_cnn.py](src/modeling/accident_cnn.py)）:MobileNetV2/ResNet18 backbone
+  （ImageNet 預訓練,離線從掛載權重載入）+ 單 logit 分類頭。
+- **不平衡**:`BCEWithLogitsLoss(pos_weight=neg/pos)`,選優看 **F1**（不看 accuracy）。
+- **影片級評估**:每片聚合幀分數（取高分位）→ 判該片是否事故,對齊 TAD 影片級標籤。
 
-### 6.4 正樣本標註（[label.py](src/data/accident/label.py)）
+### 6.4 結果（test 集）
 
-關鍵在排除標籤雜訊：以「事故時刻與事故框 **IoU 最高的軌跡**」鎖定肇事車（碰撞取前 2 台），
-正樣本**只取肇事車撞擊前後 ±1 秒**，避免把正常過路車標成事故。
+| 層級 | 指標 | 數值 |
+|---|---|---|
+| **影片級** | ROC-AUC / PR-AUC / F1 | **0.919 / 0.909 / 0.882**（TP15 FP2 FN2 TN35）|
+| 幀級 | PR-AUC / F1 | 0.895 / 0.838 |
 
-### 6.5 不平衡處理
-
-事故正樣本稀少（約 1%）。訓練用 `BCEWithLogitsLoss(pos_weight)` 補償，模型挑選看
-驗證集 **Average Precision（AP）**（對不平衡比 accuracy 有意義），切分採「依正樣本數
-分層」保證每個 split 都有事故樣本。
+> 完整評估、資料集評選與誠實標註見 [report.md](report.md)。
 
 ---
 
 ## 7. 部署架構
 
 ```
-                高公局 CCTV（MJPEG ~10fps）
-                        │ 連續抓幀
-                ┌───────▼────────┐
-                │ YOLO 偵測(11s) │  ← 共用前端，吃像素
-                │ freeway best.pt│
-                └───────┬────────┘
-                ┌───────▼────────┐
-                │ ByteTrack 追蹤 │  ← 串軌跡
-                └───┬────────┬───┘
-            走車流  │        │  走車禍
-        ┌───────────▼┐    ┌──▼─────────────┐
-        │ 計數／密度  │    │ 特徵工程(純數學)│
-        └───────────┬┘    └──┬─────────────┘
-                    │        │ (T,F) 序列
-                    │     ┌──▼──────────────┐
-                    │     │ 時序模型(LSTM)  │  ← 吃數字，跨域
-                    │     │ accident_seq.pt │
-                    │     └──┬──────────────┘
-                ┌───▼────────▼───┐
-                │ Ray Serve JSON │ → :8000 儀表板
+   高公局 CCTV（5 路 MJPEG）            TAD 測試影片（展示用）
+          │ 抓幀                              │ 逐幀
+   ┌──────▼────────┐                  ┌───────▼─────────┐
+   │ YOLO 偵測(11s)│                  │ MobileNetV2 CNN │
+   │ freeway best  │                  │ accident_tad.pt │
+   └──────┬────────┘                  └───────┬─────────┘
+   ┌──────▼────────┐                  ┌───────▼─────────┐
+   │ 車數／密度分級 │                  │ 事故/正常 + 機率 │
+   └──────┬────────┘                  └───────┬─────────┘
+          └───────────┬──────────────────────┘
+                ┌─────▼──────────┐
+                │ Ray Serve      │ → :8000 儀表板（5 路 + 右下車禍面板）
                 └────────────────┘
 ```
 
-- **偵測+追蹤只跑一次**（共用前端），之後分流給車流與車禍，省算力。
-- 部署用高公局 yolo11s（domain 對），時序模型不變（吃抽象數字）。
-- 車禍偵測需連續高 fps 抓幀（~10fps），與車流的低頻輪詢不同（Serve 整合為後續工作）。
+- 車流與車禍**共用同一個 Serve replica**（占 1 GPU）:背景輪詢 5 路相機跑 YOLO,
+  右下角面板輪播 TAD 測試影片跑 CNN。
+- 部署到高公局真實串流時,車禍 CNN 直接抓 frame 逐幀判定(同域,免追蹤)。
 
 ---
 
@@ -244,10 +235,10 @@ AccidentBench（`/data/accident`）含 2027 支真實事故影片 + 豐富 metad
 
 端點：`GET /`、`/cluster.json`、`/components.json`、`/pipeline.json`。
 
-> Pipeline 狀態自動推斷（不寫死）：車流偵測到模型已存在即標完成／可上線；車禍以
-> `accident_seq/train.npz`、`accident_final/accident_seq.pt` 是否存在 + 執行中 job 判定階段。
-> Tune log 依案別讀對應來源（freeway 走 ultralytics、accident 走 Ray Tune），解析
-> mAP 或 AP/recall/f1。
+> Pipeline 狀態自動推斷（不寫死）：車流偵測到模型已存在即標完成；車禍以
+> `accident_tad_seq/train.npz`、`accident_tad_final/accident_tad.pt` 是否存在 +
+> serve replica 是否存活（事故模型部署其中）判定四階段。Tune/Train log 依案別讀對應
+> 來源（freeway 走 ultralytics、accident 走 Ray Train），解析 mAP 或 F1/AP。
 
 ---
 
@@ -255,22 +246,24 @@ AccidentBench（`/data/accident`）含 2027 支真實事故影片 + 豐富 metad
 
 ```
 src/
-├── core/          叢集連線（init_ray）
-├── modeling/      accident.py：時序模型 LSTM/GRU/1D-CNN
+├── core/             叢集連線（init_ray）
+├── modeling/         accident_cnn.py：MobileNetV2/ResNet18 事故二分類
 ├── data/
-│   ├── freeway/   高公局抓取(grabber)、SAHI 自動標註(prelabel)、鏡頭切分、Ray Data
-│   └── accident/  tracking（YOLO+ByteTrack）、features（運動特徵）、
-│                  label（肇事車標註）、pipeline（Ray Data 主流程）
+│   ├── freeway/      高公局抓取(grabber)、SAHI 自動標註(prelabel)、鏡頭切分、Ray Data
+│   ├── accident_cnn/ 逐幀事故圖 Ray Data（防洩漏 block 切分，共用基礎設施）
+│   └── accident_tad/ TAD 影片級切分 Ray Data（主線）
 ├── train/
-│   ├── freeway/   Ray Train 偵測訓練
-│   └── accident/  trainer.py：時序模型訓練核心（Tune/Train 共用）
-├── serve/         Ray Serve 車流相機推論（app.py + dashboard.html）
-└── monitor/       RAY MONITOR（state.py + overview.html，兩條 pipeline）
+│   ├── freeway/      Ray Train 偵測訓練
+│   └── accident_cnn/ trainer.py：CNN 訓練核心 + ray.put 物件存儲共享（Tune/Train 共用）
+├── serve/            Ray Serve（app.py 車流推論 + TAD 影片 demo，dashboard.html）
+└── monitor/          RAY MONITOR（state.py + overview.html，兩條 pipeline）
 
-scripts/           prepare_/tune_/train_freeway、prepare_/tune_/train_/eval_accident、
-                   prelabel_freeway、serve_dashboard、monitor
-datasets/          資料、權重、accident_seq 時序資料集（不納入版控）
-ray_results/       訓練與搜參輸出（不納入版控）
+scripts/   prepare_/tune_/train_freeway、prelabel_freeway、
+           prepare_accident_tad、prepare_/tune_/train_/eval_accident_cnn、eval_accident_tad、
+           serve_dashboard、monitor
+datasets/  TAD frames、DETRAC、權重、處理後 npz（不納入版控）
+ray_results/  訓練與搜參輸出（不納入版控）
+_archive/  封存的軌跡法/圖片集程式與舊 run（不納入版控）
 ```
 
 ---
@@ -279,19 +272,18 @@ ray_results/       訓練與搜參輸出（不納入版控）
 
 | 模型 | Test Set | 主要指標 | 狀態 |
 |------|----------|----------|------|
-| **Freeway**（yolo11s） | 1 整支鏡頭（鏡頭級隔離）| **mAP50 0.847 / mAP50-95 0.744** | ✅ 完成、可上線 |
-| **Accident**（時序） | 影片級隔離（窗級 + 事件級）| 流程已端到端驗證；窗級 AP 優化中 | 🔄 輕量測試版 |
+| **Freeway**（yolo11s） | 1 整支鏡頭（鏡頭級隔離）| **mAP50 0.847 / mAP50-95 0.744** | ✅ 完成、已上線 |
+| **Accident**（TAD CNN） | **影片級隔離** | **影片級 ROC-AUC 0.92 / F1 0.88**；幀級 PR-AUC 0.90 | ✅ 完成、已上線 |
 
 說明：
 
-- **Freeway** 已完成 Ray 四階段並可部署，是系統的偵測前端骨幹。
-- **Accident** 的四階段（Data→Tune→Train→Eval）已完整跑通；目前為**輕量測試模型**。
-  因事故正樣本稀少 + 弱標籤，窗級 AP 仍偏低，正以**收緊正樣本（肇事車 ±1s）**與
-  **事件級評估**提升鑑別力。架構（運動特徵 + 時序模型）與資料無關，未來換高公局真實
-  事故或擴大資料皆不需改架構。
+- **Freeway** 完成 Ray 四階段並部署,5 路即時偵測,是系統的偵測前端骨幹。
+- **Accident** 完成 Ray 四階段並接進儀表板。採 TAD 同域資料 + **影片級切分**,得到
+  誠實的影片級 ROC 0.92(17 支事故抓 15、37 正常誤報 2)。
+- **誠實標註**:0.92 為同域 in-domain;高公局無標註,跨域未驗證。TAD 粗標籤 → 模型
+  判「事故場景」而非「撞擊瞬間」,不做精準時間定位。
 
-> 設計取捨、資料集評選（UCF-Crime／CADP／TUMTraf／AccidentBench）與除錯過程見
-> [NOTE.md](NOTE.md)。
+> 完整評估與 Demo 見 [report.md](report.md);設計演進、資料集評選與除錯見 [NOTE.md](NOTE.md)。
 
 ---
 
@@ -304,12 +296,15 @@ ray_results/       訓練與搜參輸出（不納入版控）
 | **車流** ① Ray Data | `python scripts/prepare_freeway.py` |
 | **車流** ② Ray Tune | `python scripts/tune_freeway.py` |
 | **車流** ③ Ray Train | `python scripts/train_freeway.py` |
-| **車禍** ① Ray Data | `python scripts/prepare_accident.py` |
-| **車禍** ② Ray Tune | `python scripts/tune_accident.py --samples 24`（CPU 三節點平行）|
-| **車禍** ③ Ray Train | `python scripts/train_accident.py --kind gru --hidden 128 --layers 2` |
-| **車禍** 評估 | `python scripts/eval_accident.py`（窗級 + 事件級）|
-| 車流即時儀表板 | `python scripts/serve_dashboard.py`（:8000，佔 GPU）|
+| **車禍** ① Ray Data | `python scripts/prepare_accident_tad.py` |
+| **車禍** ② Ray Tune | `python scripts/tune_accident_cnn.py --data-dir /workspace/datasets/accident_tad_seq --run-name accident_tad_tune` |
+| **車禍** ③ Ray Train | `python scripts/train_accident_cnn.py --data-dir /workspace/datasets/accident_tad_seq --save-path /workspace/ray_results/accident_tad_final/accident_tad.pt --run-name accident_tad_final_raytrain --no-freeze --lr 1e-4 --epochs 15` |
+| **車禍** 評估 | `python scripts/eval_accident_tad.py`（影片級 + 幀級）|
+| 車流＋車禍儀表板 | `python scripts/serve_dashboard.py`（:8000，佔 GPU）|
 | 關閉叢集 | `docker compose down` |
+
+> 透過 Bash/Git Bash 執行含 `/workspace/...` 絕對路徑參數時,前面加 `MSYS_NO_PATHCONV=1`
+> 避免路徑被竄改成 `C:/Program Files/Git/...`。
 
 ---
 

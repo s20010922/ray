@@ -241,10 +241,10 @@ async function pollCluster(){
           '<span class="tasks'+(n.ray_tasks>0?' on':'')+'">⚡'+n.ray_tasks+' 任務</span>'+
           '<span class="nip">'+n.address+'</span>'+
         '</div>'+
-        '<div class="res">CPU <b>'+n.cpu+'</b>核 · GPU <b>'+n.gpu+'</b> · RAM <b>'+n.mem_gb+'G</b> · OBJ <b>'+n.obj_gb+'G</b></div>'+
+        '<div class="res">CPU <b>'+n.cpu+'</b>核 · GPU <b>'+n.gpu+'</b> · RAM <b>'+n.mem_used_gb+'</b>/'+n.mem_gb+'G · OBJ <b>'+n.obj_gb+'G</b></div>'+
         loadRow('Ray', n.ray_pct, '<b>'+n.ray_tasks+'</b>/'+n.cpu)+
         (n.gpu ? loadRow('GPU', n.gpu_pct) : '')+
-        loadRow('MEM', n.mem_pct)+
+        loadRow('MEM', n.mem_pct, n.mem_used_gb+'G')+
         loadRow('OBJ', n.obj_pct)+
       '</div>').join('');
   }catch(e){ document.getElementById('cdot').className='dot warn'; }

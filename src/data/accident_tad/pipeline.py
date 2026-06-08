@@ -112,7 +112,12 @@ def prepare(root: str = TAD_ROOT,
     print(f"[Ray Data] 抽幀後總樣本 {len(items)}（每片≤{k} 幀）")
 
     ds = ray.data.from_items(items, override_num_blocks=64)
-    rows = ds.map(_decode).take_all()
+    rows, prog = [], out / "_progress.txt"           # 邊處理邊寫進度（供 MONITOR %）
+    for r in ds.map(_decode).iter_rows():
+        rows.append(r)
+        if len(rows) % 256 == 0:
+            prog.write_text(str(len(rows)))
+    prog.write_text(str(len(rows)))
 
     buckets = {"train": [], "val": [], "test": []}
     for r in rows:

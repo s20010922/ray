@@ -85,7 +85,12 @@ def prepare(root: str = CNN_ROOT,
     (out / "_total.txt").write_text(str(len(items)))     # 供 MONITOR 進度%
 
     ds = ray.data.from_items(items, override_num_blocks=48)
-    rows = ds.map(_decode).take_all()                    # 3 節點分散解碼
+    rows, prog = [], out / "_progress.txt"               # 邊處理邊寫進度
+    for r in ds.map(_decode).iter_rows():                # 3 節點分散解碼
+        rows.append(r)
+        if len(rows) % 256 == 0:
+            prog.write_text(str(len(rows)))
+    prog.write_text(str(len(rows)))
 
     buckets = {"train": [], "val": [], "test": []}
     for r in rows:

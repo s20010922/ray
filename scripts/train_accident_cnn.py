@@ -12,7 +12,7 @@ from ray.train.torch import TorchTrainer
 
 from src.train.accident_cnn.trainer import DATA_DIR, fit
 
-SAVE_PATH = "/workspace/ray_results/accident_cnn_final/accident_cnn.pt"
+SAVE_PATH = "/workspace/ray_results/accident_tad_final/accident_tad.pt"  # 對齊 eval/serve
 
 
 def _train_loop(config):
@@ -27,20 +27,22 @@ def _train_loop(config):
 
 def main():
     ap = argparse.ArgumentParser(description="逐幀事故二分類 Ray Train")
-    ap.add_argument("--data-dir", default=DATA_DIR)
+    ap.add_argument("--data-dir",
+                    default="/workspace/datasets/accident_tad_seq")
     ap.add_argument("--backbone", default="mobilenet_v2",
                     choices=["mobilenet_v2", "resnet18"])
-    ap.add_argument("--freeze", action="store_true", default=True)
+    ap.add_argument("--freeze", action="store_true", default=False,
+                    help="凍結 backbone 只訓練分類頭；預設解凍全網微調（0.92 設定）")
     ap.add_argument("--no-freeze", dest="freeze", action="store_false")
     ap.add_argument("--dropout", type=float, default=0.2)
     ap.add_argument("--aug", type=float, default=0.2)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=1e-4)   # 解凍微調用小 lr（0.92 設定）
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch", type=int, default=32)   # 限 32：batch 64 會吃滿 8G VRAM 卡桌面
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--save-path", default=SAVE_PATH)
-    ap.add_argument("--run-name", default="accident_cnn_final_raytrain",
-                    help="Ray Train run 目錄名（TAD 用 accident_tad_final_raytrain）")
+    ap.add_argument("--run-name", default="accident_tad_final_raytrain",
+                    help="Ray Train run 目錄名（MONITOR Train % 依此名抓進度）")
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
 

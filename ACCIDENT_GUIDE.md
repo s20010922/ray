@@ -255,8 +255,8 @@ docker compose exec ray-head tail -f ray_results/accident_tad_final_raytrain/wor
 
 ### 預期結果
 
-- **驗證 F1** ~ 0.83–0.84（15 epoch）
-- **測試影片級 ROC-AUC** ~ 0.92（評估用 eval_accident_tad.py）
+- **訓練** 15 epoch 後存最佳權重（解凍微調 lr 1e-4）
+- **測試影片級 ROC-AUC** ~ 0.96 / F1 ~ 0.91（評估用 eval_accident_tad.py，主指標）
 - **最終權重** 存於 `ray_results/accident_tad_final/accident_tad.pt`
 
 > 注：訓練用 F1（幀級），評估用 ROC-AUC（影片級，更重要）。
@@ -294,13 +294,13 @@ docker compose exec ray-head python scripts/eval_accident_tad.py \
 
 ```
 === TAD test 幀級(xxxx 幀，事故 xxxx)===
-[PR-AUC] 0.8950  (隨機=0.3200)
-[最佳F1] 0.8380 @thr0.50  P=0.9050 R=0.7800
+[PR-AUC] 0.8923  (隨機=0.3229)
+[最佳F1] 0.8960 @thr0.05  P=0.9100 R=0.8820
 
 === TAD test 影片級(54 片，事故 17，聚合=每片第90百分位)===
-[ROC-AUC] 0.9190   [PR-AUC] 0.9090
-[最佳F1] 0.8820 @thr0.45  P=0.8820 R=0.8820
-[混淆矩陣] TP=15 FP=2 FN=2 TN=35  acc=0.9260
+[ROC-AUC] 0.9603   [PR-AUC] 0.9006
+[最佳F1] 0.9090 @thr0.10  P=0.9380 R=0.8820
+[混淆矩陣] TP=15 FP=1 FN=2 TN=36  acc=0.9440
 ```
 
 ### 指標說明
@@ -309,7 +309,7 @@ docker compose exec ray-head python scripts/eval_accident_tad.py \
 |------|------|
 | **影片級 ROC-AUC** | 在 54 支測試影片上，分辨事故/正常的能力 |
 | **影片級 F1** | 精準率與召回率的調和平均 |
-| **混淆矩陣** | TP 15/17 (88% 事故抓到) + FP 2/37 (95% 正常沒誤報) |
+| **混淆矩陣** | TP 15/17 (88% 事故抓到) + FP 1/37 (97% 正常沒誤報) |
 
 ---
 
@@ -343,8 +343,9 @@ Ray Serve（同一 replica）
 ### 啟動
 
 ```bash
-# 自動載入 accident_tad.pt 並啟動 demo
-docker compose up ray-serve   # 或 restart if running
+# 啟動 Serve（前景，自動載入 accident_tad.pt + best.pt）
+docker compose exec ray-head python scripts/serve_dashboard.py
+#   注意：compose 沒有 ray-serve service，不能用 `docker compose up ray-serve`
 
 # 驗證
 # 瀏覽器開 http://localhost:8000
@@ -386,7 +387,7 @@ docker compose exec ray-head python scripts/train_accident_cnn.py --epochs 15
 
 # ❺ Stage 4：評估 + 上線
 docker compose exec ray-head python scripts/eval_accident_tad.py  # 驗證指標
-docker compose restart ray-serve                                   # 啟動 demo
+docker compose exec ray-head python scripts/serve_dashboard.py     # 啟動 demo（無 ray-serve service）
 
 # ❻ 驗證
 # 瀏覽器開 http://localhost:8000  → 右下角看 TAD demo 面板
@@ -418,14 +419,14 @@ docker compose restart ray-serve                                   # 啟動 demo
 
 | 指標 | 數值 |
 |------|------|
-| **影片級 ROC-AUC** | **0.919** |
-| **影片級 PR-AUC** | **0.909** |
-| **影片級 F1** | **0.882** |
+| **影片級 ROC-AUC** | **0.960** |
+| **影片級 PR-AUC** | **0.901** |
+| **影片級 F1** | **0.909** |
 | **訓練時間** | ～10 分鐘（15 epoch，RTX 3060 Ti） |
 | **推論延遲** | < 10ms 單幀（GPU） |
 | **Demo 刷新率** | 2 秒/幀（與 Freeway 同步） |
 
-> **實戰意義**：17 支事故影片抓到 15 支（88%），37 支正常只誤報 2 支（95% 精準）。
+> **實戰意義**：17 支事故影片抓到 15 支（88%），37 支正常只誤報 1 支（97% 精準）。
 
 ---
 
@@ -445,4 +446,4 @@ docker compose restart ray-serve                                   # 啟動 demo
 
 ---
 
-> **簡報用重點**：影片級防洩漏設計 + ROC-AUC **0.92** + 混淆矩陣展示實戰能力。
+> **簡報用重點**：影片級防洩漏設計 + ROC-AUC **0.96** + 混淆矩陣展示實戰能力。

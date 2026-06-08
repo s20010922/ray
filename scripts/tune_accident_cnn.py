@@ -24,7 +24,8 @@ def trainable(config, data=None):
 
 def main():
     ap = argparse.ArgumentParser(description="逐幀事故二分類 Ray Tune")
-    ap.add_argument("--data-dir", default=DATA_DIR)
+    ap.add_argument("--data-dir",
+                    default="/workspace/datasets/accident_tad_seq")
     ap.add_argument("--samples", type=int, default=12)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--gpu-per-trial", type=float, default=0.5,
@@ -45,7 +46,7 @@ def main():
         "aug": tune.uniform(0.1, 0.3),
         "lr": tune.loguniform(1e-4, 3e-3),
         "weight_decay": tune.loguniform(1e-6, 1e-3),
-        "batch": tune.choice([32, 64]),
+        "batch": tune.choice([16, 32]),     # 限 ≤32：batch 64 會吃滿 8G VRAM 卡桌面
     }
     scheduler = ASHAScheduler(metric="f1", mode="max", max_t=args.epochs,
                               grace_period=min(3, args.epochs))

@@ -45,7 +45,9 @@ def _level(value: float, bands) -> str:
 
 def _build_tad_demo(model_path: str, data_dir: str, frames_root: str,
                     device: str, n_acc: int = 3, n_norm: int = 3,
-                    fpv: int = 40, thr: float = 0.5, disp_w: int = 480):
+                    fpv: int = 40, thr: float = 0.5, disp_w: int = 480,
+                    onset_min: float = 0.25, early_max: float = 0.55,
+                    late_min: float = 0.6):
     """B 方案：讀 TAD **測試影片**的原始幀，按時間播放、TAD 模型逐幀打分。
 
     只取 test split 的影片（模型沒訓練過），事故/正常各幾支，交錯排。
@@ -98,19 +100,23 @@ def _build_tad_demo(model_path: str, data_dir: str, frames_root: str,
         return np.array(out)
 
     # ── 第一輪：對所有 test 影片打分，挑「會呈現時間反應」的片 ──
-    # 事故片挑 onset 最明顯者(前段低、後段高 → 出事才報，避免一開始就 100%)；
+    # 事故片只留「真的有時間轉折」者：前段像正常(early<early_max)、後段確實報事故
+    # (late>=late_min)、上升幅度夠(onset>=onset_min)。藉此排除兩種不適合展示的片：
+    #   ① 一開場車禍就在畫面、整片滿分（early 已高）→ 看不出「逐幀偵測」感
+    #   ② 全程低分、模型漏報（late 偏低）
     # 正常片挑全程分數最低者(最乾淨、不誤報)。
     acc = sorted(meta[str(v)]["name"] for v in test_vids if meta[str(v)]["label"] == 1)
     norm = sorted(meta[str(v)]["name"] for v in test_vids if meta[str(v)]["label"] == 0)
-    acc_cand, norm_cand = [], []
+    acc_all, norm_cand = [], []
     for name in acc:
         paths = _sel_frames(name, 1)
         if not paths:
             continue
         s = _scores(paths)
         third = max(1, len(s) // 3)
-        onset = float(s[-third:].mean() - s[:third].mean())   # 後段-前段
-        acc_cand.append((onset, name, 1, paths, s))
+        early = float(s[:third].mean())
+        late = float(s[-third:].mean())
+        acc_all.append((late - early, early, late, name, paths, s))
     for name in norm:
         paths = _sel_frames(name, 0)
         if not paths:
@@ -118,7 +124,15 @@ def _build_tad_demo(model_path: str, data_dir: str, frames_root: str,
         s = _scores(paths)
         norm_cand.append((float(s.mean()), name, 0, paths, s))
 
-    acc_cand.sort(key=lambda x: x[0], reverse=True)    # onset 大→小
+    # 只留 onset 真的明顯的事故片（前低後高）；按上升幅度排序
+    clear = [c for c in acc_all
+             if c[0] >= onset_min and c[1] < early_max and c[2] >= late_min]
+    clear.sort(key=lambda x: x[0], reverse=True)
+    if not clear and acc_all:           # 全無明顯 onset → 至少留 onset 最大一支，避免事故格全空
+        clear = [max(acc_all, key=lambda x: x[0])]
+    acc_cand = [(c[0], c[3], 1, c[4], c[5]) for c in clear]   # 還原成 (onset,name,label,paths,s)
+    print(f"[serve] 事故片(明顯 onset)入選 {len(acc_cand)}/{len(acc_all)} 支："
+          + ", ".join(c[1] for c in acc_cand))
     norm_cand.sort(key=lambda x: x[0])                 # 平均分 低→高
     picks = []
     for i in range(max(n_acc, n_norm)):                # 事故/正常交錯

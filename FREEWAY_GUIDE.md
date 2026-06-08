@@ -160,11 +160,12 @@ docker compose exec ray-head tail -f ray_results/freeway_final/results.csv
 ### 啟動 Serve
 
 ```bash
-# 自動載入最佳權重
-docker compose up ray-serve  # or restart if already running
+# 啟動 Serve（前景，自動載入 best.pt）
+docker compose exec ray-head python scripts/serve_dashboard.py
+#   注意：compose 沒有 ray-serve service，不能用 `docker compose up ray-serve`
 
-# 驗證 Serve 健康
-docker compose exec ray-head python -c "import ray; ray.init(address='auto'); print('Connected'); ray.shutdown()"
+# CPU 推論並釋出 GPU（邊訓練邊看 MONITOR 用）
+docker compose exec ray-head python scripts/serve_dashboard.py --no-gpu
 ```
 
 ### 存取儀表板
@@ -195,8 +196,8 @@ docker compose exec ray-head python scripts/tune_freeway.py --num-trials 2
 # ❹ Stage 3：正式訓練（～3 小時，GPU）
 docker compose exec ray-head python scripts/train_freeway.py --epochs 100
 
-# ❺ Stage 4：上線
-docker compose restart ray-serve               # Serve 自動載入 best.pt
+# ❺ Stage 4：上線（正確指令；compose 無 ray-serve service）
+docker compose exec ray-head python scripts/serve_dashboard.py   # 載入 best.pt 上線
 
 # ❻ 驗證
 # 瀏覽器開 http://localhost:8000  → 5 路相機即時跑
@@ -238,8 +239,8 @@ docker compose exec ray-head python scripts/train_freeway.py \
 
 | 指標 | 數值 |
 |------|------|
-| **mAP50** | **0.847** |
-| **mAP50-95** | **0.744** |
+| **mAP50** | **0.833** |
+| **mAP50-95** | **0.712** |
 | **訓練時間** | ～3 小時（RTX 3060 Ti） |
 | **推論延遲** | < 50ms 單幀（GPU） |
 | **線上相機數** | 5 路即時 |
@@ -261,4 +262,4 @@ docker compose exec ray-head python scripts/train_freeway.py \
 
 ---
 
-> **簡報用重點**：鏡頭級隔離防洩漏 + mAP50 **0.847** + 5 路即時上線。
+> **簡報用重點**：鏡頭級隔離防洩漏 + mAP50 **0.833** + 5 路即時上線。

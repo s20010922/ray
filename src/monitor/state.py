@@ -93,6 +93,116 @@ def _gpu_util_smi():
         return None
 
 
+def _gpu_mem_smi():
+    """nvidia-smi 即時 GPU 記憶體 (已用GiB, 總量GiB)；dashboard 的 mem 在 docker
+    會卡住（實測 4 次抓全一樣），故跟 util 一樣直讀 smi。訓練時 VRAM 才是真正
+    浮動的記憶體（主機 RAM 載完資料後幾乎不動）。"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3)
+        vals = [int(x) for x in out.stdout.replace(",", " ").split()
+                if x.strip().isdigit()]
+        if len(vals) >= 2:
+            return round(vals[0] / 1024, 1), round(vals[1] / 1024, 1)
+    except Exception:
+        pass
+    return None, None
+
+
+def _cpu_pct_live():
+    """主機實體 CPU 使用率(%)；dashboard 的 cpu 在 docker 會卡住（實測凍 3.2%），
+    改用 psutil 直讀。GPU tune 的 trial 只佔 GPU 不佔 CPU，Ray 邏輯 CPU=0 會誤導，
+    故 cluster 摘要改顯示實體使用率。"""
+    try:
+        import psutil
+        return psutil.cpu_percent(interval=0.2)
+    except Exception:
+        return None
+
+
+@ray.remote(num_cpus=0)
+def _node_probe():
+    """在「所在節點」上實量，回報該容器自己的 CPU% 與記憶體用量。
+
+    記憶體讀 **cgroup**（`memory.current` 扣掉可回收的 file cache）——這是「這個
+    容器吃了多少」的隔離計量，head/worker 各自不同；不像 psutil.virtual_memory()
+    會讀到整台共享 VM 而三節點相同。讀不到 cgroup 才退回 psutil。分母（總量）由
+    呼叫端用 Ray 的 --memory 預算（12G/4G/4G），故這裡只回已用量。
+    """
+    import psutil
+
+    def _cgroup_used():
+        # cgroup v2：memory.current - inactive_file；v1：usage_in_bytes - total_inactive_file
+        for cur_p, stat_p, key in (
+            ("/sys/fs/cgroup/memory.current",
+             "/sys/fs/cgroup/memory.stat", "inactive_file "),
+            ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+             "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file ")):
+            try:
+                cur = int(open(cur_p).read().strip())
+            except OSError:
+                continue
+            cache = 0
+            try:
+                for ln in open(stat_p):
+                    if ln.startswith(key):
+                        cache = int(ln.split()[1])
+                        break
+            except OSError:
+                pass
+            return max(cur - cache, 0)
+        return None
+
+    used = _cgroup_used()
+    if used is None:
+        used = psutil.virtual_memory().used      # fallback：讀不到 cgroup
+    return {
+        "cpu_pct": round(psutil.cpu_percent(interval=0.15), 1),
+        "mem_used_gb": round(used / 2**30, 2),
+    }
+
+
+def _node_probes():
+    """對每個存活節點派 _node_probe（NodeAffinity 釘節點），收齊真值。
+
+    回傳 {node_id: {cpu_pct, mem_used_gb, mem_total_gb, mem_pct}}；任何節點失敗
+    或逾時就略過該節點，呼叫端 fallback 回 dashboard 舊值。
+    """
+    try:
+        from ray.util.scheduling_strategies import (
+            NodeAffinitySchedulingStrategy)
+    except Exception:
+        return {}
+    ref_to_nid = {}
+    for n in ray.nodes():
+        if not n.get("Alive"):
+            continue
+        nid = n.get("NodeID", "")
+        try:
+            ref = _node_probe.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    nid, soft=False)).remote()
+            ref_to_nid[ref] = nid
+        except Exception:
+            continue
+    out = {}
+    if not ref_to_nid:
+        return out
+    try:
+        ready, _ = ray.wait(list(ref_to_nid), num_returns=len(ref_to_nid),
+                            timeout=2.5)
+        for ref in ready:
+            try:
+                out[ref_to_nid[ref]] = ray.get(ref)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def _dashboard_nodes():
     """抓 Ray Dashboard 的每節點實體負載（CPU%/GPU 利用率/記憶體/object store）。"""
     try:
@@ -176,17 +286,35 @@ def _bar(pct, width=16):
     return "█" * fill + "░" * (width - fill)
 
 
-def _data_progress(parts="/workspace/datasets/accident_seq/_parts"):
-    """事故 Ray Data 進度 (done, total, pct)；無進行中則 None。"""
-    try:
-        tp = os.path.join(parts, "_total.txt")
-        if not os.path.exists(tp):
-            return None
-        total = int(open(tp, encoding="utf-8").read().strip())
-        done = sum(1 for f in os.listdir(parts) if f.endswith(".npz"))
-        return done, total, (round(100 * done / total) if total else 0)
-    except Exception:
-        return None
+_DATA_DIRS = [
+    "/workspace/datasets/freeway_prepared",
+    "/workspace/datasets/accident_tad_seq",
+    "/workspace/datasets/accident_cnn_seq",
+]
+
+
+def _data_progress():
+    """Ray Data 前處理進度 (done, total, pct)；無進行中則 None。
+
+    pipeline 處理時往輸出目錄寫 _total.txt（總項數）與 _progress.txt（已完成數，
+    每幾百項刷一次）。只在「_progress 仍在更新（mtime<30s）且 done<total」時回傳，
+    完成或過期就回 None 讓卡片轉閒置。
+    """
+    for d in _DATA_DIRS:
+        tp = os.path.join(d, "_total.txt")
+        pp = os.path.join(d, "_progress.txt")
+        if not (os.path.exists(tp) and os.path.exists(pp)):
+            continue
+        try:
+            if time.time() - os.path.getmtime(pp) > 30:
+                continue                      # 太久沒更新 → 視為非進行中
+            total = int(open(tp, encoding="utf-8").read().strip())
+            done = int(open(pp, encoding="utf-8").read().strip())
+        except Exception:
+            continue
+        if total > 0 and done < total:
+            return done, total, round(100 * done / total)
+    return None
 
 
 _PIPE_STATE_FILE = "/workspace/ray_results/_pipeline_state.json"
@@ -218,16 +346,22 @@ def pipeline_state():
     kind, case = _active_job()
     cur_stage = job_to_stage.get(kind)
 
-    # ── 車流（Freeway）：模型已訓練完成、可上線 ──
+    # ── 車流（Freeway）：依產物與執行中任務推斷（可清空，不再寫死）──
     fw_serve = _serve_alive()
+    fw_data = _exists("/workspace/datasets/freeway_prepared/dataset.yaml")
+    fw_model = _exists("/workspace/ray_results/freeway_final/weights/best.pt")
+    fw_done = ["prepare"] if fw_data else []
+    if fw_model:
+        fw_done = ["prepare", "tune", "train"]
     traffic = {"name": "車流偵測（Freeway）", "stages": stages,
                "current": None, "ready": None,
-               "done": ["prepare", "tune", "train"],
-               "status": "done" if fw_serve else "ready"}
-    if fw_serve:
-        traffic["done"].append("serve")
-    else:
-        traffic["ready"] = "serve"          # 訓練完成、待上線
+               "done": fw_done, "status": "idle"}
+    if fw_serve and fw_model:
+        traffic.update(done=["prepare", "tune", "train", "serve"], status="done")
+    elif fw_model:
+        traffic.update(ready="serve", status="ready")   # 訓練完成、待上線
+    elif fw_done:
+        traffic["status"] = "partial"
     if case == "freeway" and cur_stage:     # freeway 任務正在跑 → 反映進度
         traffic.update(current=cur_stage, ready=None, status="running",
                        done=ids[:ids.index(cur_stage)])
@@ -307,11 +441,92 @@ def _active_job():
     return ("", "")
 
 
+def _active_entrypoint():
+    """執行中 job 的 entrypoint 字串（給解析 --epochs/--samples 用）。"""
+    try:
+        from ray.util.state import list_jobs
+        for j in list_jobs(limit=200):
+            if "RUNNING" in str(getattr(j, "status", "")).upper():
+                return getattr(j, "entrypoint", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _flag_int(ep, names, default):
+    """從 entrypoint 解析 `--flag N`（找不到回 default）。"""
+    import re
+    for n in names:
+        m = re.search(rf"{re.escape(n)}[=\s]+(\d+)", ep)
+        if m:
+            return int(m.group(1))
+    return default
+
+
+def _csv_rows(path):
+    """results.csv 資料列數（= 已完成 epoch 數，扣表頭）；讀不到回 0。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return max(sum(1 for _ in f) - 1, 0)
+    except OSError:
+        return 0
+
+
+def _json_rows(experiments, base="/workspace/ray_results"):
+    """某類 run 最新 result.json 的列數（= 已完成 epoch 數）；無則 0。"""
+    files = []
+    for e in experiments:
+        files += glob.glob(f"{base}/{e}/**/result.json", recursive=True)
+    if not files:
+        return 0
+    try:
+        newest = max(files, key=os.path.getmtime)
+        with open(newest, encoding="utf-8") as f:
+            return sum(1 for r in f.read().splitlines() if r.strip())
+    except OSError:
+        return 0
+
+
+def _train_pct(kind, case, ep):
+    """正式訓練進度 %（已完成 epoch / 目標 epoch）；無法判定回 None。"""
+    if kind != "train":
+        return None
+    if case == "freeway":
+        done = _csv_rows("/workspace/ray_results/freeway_final/results.csv")
+        total = _flag_int(ep, ["--epochs"], 100)
+    else:
+        done = _json_rows(["accident_tad_final_raytrain",
+                           "accident_cnn_final_raytrain"])
+        total = _flag_int(ep, ["--epochs"], 15)
+    return min(round(100 * done / total), 100) if total else None
+
+
+def _tune_pct(kind, case, ep):
+    """超參搜尋進度 %（已完成 trial / 目標數）；無法判定回 None（最佳努力）。"""
+    if kind != "tune":
+        return None
+    if case == "freeway":
+        total = _flag_int(ep, ["--iterations"], 12)
+        done = len(glob.glob(
+            "/workspace/runs/detect/tune*/**/result.json", recursive=True))
+    else:
+        total = _flag_int(ep, ["--samples"], 12)
+        done = len(glob.glob(
+            "/workspace/ray_results/accident_cnn_tune/*/result.json")) \
+            or len(glob.glob(
+                "/workspace/ray_results/accident_tad_tune/*/result.json"))
+    if total and done:
+        return min(round(100 * done / total), 100)
+    return None
+
+
 def cluster_state():
     """節點清單 + 每節點負載 + 叢集資源總量。"""
     dash = _dashboard_nodes()
     tasks_per_node = _running_tasks_per_node()
     gpu_smi = _gpu_util_smi()        # 即時 GPU 利用率（取代 dashboard 的卡住值）
+    vram_used, vram_total = _gpu_mem_smi()   # 即時 VRAM（取代卡住的 dashboard mem）
+    probes = _node_probes()          # 每節點實跑 psutil 的真值（取代凍住的 mem）
 
     nodes = []
     for n in ray.nodes():
@@ -327,7 +542,20 @@ def cluster_state():
             gpu_pct = gpu_smi
         else:
             gpu_pct = gpus[0].get("utilizationGpu", 0) if gpus else 0
-        mem = dn.get("mem") or []
+        # 記憶體：分母 = Ray --memory 預算（12G/4G/4G，各節點不同）；
+        # 分子 = 該容器 cgroup 真實用量（探針回報，head/worker 各自不同）。
+        # 探針失敗才退回 dashboard 的 mem[已用]。
+        mem_total_gb = round(res.get("memory", 0) / 2**30, 1)      # Ray 預算
+        pr = probes.get(nid)
+        if pr:
+            mem_used_gb = pr["mem_used_gb"]            # cgroup 容器真實用量
+            node_cpu_pct = pr["cpu_pct"]
+        else:
+            mem = dn.get("mem") or []     # [總量, 可用, 主機%, 已用]
+            mem_used_gb = round(mem[3] / 2**30, 2) if len(mem) > 3 else 0.0
+            node_cpu_pct = round(dn.get("cpu", 0), 1)
+        mem_pct = round(min(mem_used_gb / mem_total_gb * 100, 100), 1) \
+            if mem_total_gb else 0
         obj_used = rl.get("objectStoreUsedMemory", 0)
         obj_avail = rl.get("objectStoreAvailableMemory", 0)
         obj_tot = obj_used + obj_avail
@@ -338,10 +566,16 @@ def cluster_state():
             "address": n.get("NodeManagerAddress", ""),
             "cpu": cpu,
             "gpu": gpu,
-            "cpu_pct": round(dn.get("cpu", 0), 1),
+            "cpu_pct": node_cpu_pct,
             "gpu_pct": round(gpu_pct or 0, 1),
-            "mem_pct": round(mem[2], 1) if len(mem) > 2 else 0,
-            "mem_gb": round(res.get("memory", 0) / 2**30, 1),
+            "mem_pct": mem_pct,
+            "mem_gb": mem_total_gb,
+            "mem_used_gb": mem_used_gb,
+            # VRAM（只 GPU 節點有；nvidia-smi 即時值，訓練時會浮動）
+            "vram_used_gb": vram_used if (gpu and vram_used is not None) else 0,
+            "vram_total_gb": vram_total if (gpu and vram_total) else 0,
+            "vram_pct": round(vram_used / vram_total * 100, 1)
+                        if (gpu and vram_total) else 0,
             "obj_pct": round(obj_used / obj_tot * 100, 1) if obj_tot else 0,
             "obj_gb": round(obj_tot / 2**30, 1),
             "ray_tasks": ray_tasks,                                 # 邏輯負載
@@ -354,11 +588,15 @@ def cluster_state():
     avail = ray.available_resources()
     obj_tot = total.get("object_store_memory", 0)
     obj_used = obj_tot - avail.get("object_store_memory", 0)
+    cpu_total = total.get("CPU", 0)
+    cpu_live = _cpu_pct_live()       # 實體使用率（取代會誤導的 Ray 邏輯保留）
+    cpu_used = round(cpu_live / 100 * cpu_total) if cpu_live is not None \
+        else round(cpu_total - avail.get("CPU", 0))
     return {
         "node_count": sum(1 for x in nodes if x["alive"]),
         "nodes": nodes,
-        "cpu_total": total.get("CPU", 0),
-        "cpu_used": round(total.get("CPU", 0) - avail.get("CPU", 0), 1),
+        "cpu_total": cpu_total,
+        "cpu_used": cpu_used,
         "gpu_total": total.get("GPU", 0),
         "gpu_used": round(total.get("GPU", 0) - avail.get("GPU", 0), 2),
         "obj_total_gb": round(obj_tot / 2**30, 1),
@@ -403,10 +641,17 @@ def components_state():
                 "log": log or []}
 
     data_log = _data_log_rolling(data_ops)          # 滾動歷史（時間戳 + 運算元）
-    prog = _data_progress()                          # 事故 Ray Data 進度 %
+    prog = _data_progress()                          # Ray Data 前處理進度 %
     if prog:
         done, total, pct = prog
-        data_log = [f"進度 {done}/{total} 支　{pct}%　{_bar(pct)}"] + data_log
+        data_log = [f"進度 {done}/{total} 項　{pct}%　{_bar(pct)}"] + data_log
+
+    ep_str = _active_entrypoint()                    # 解析 --epochs/--samples
+    train_pct = _train_pct(kind, case, ep_str)       # 正式訓練 %
+    tune_pct = _tune_pct(kind, case, ep_str)         # 超參搜尋 %
+
+    def _pct(p):                                     # 進度條後綴（無 % 則空字串）
+        return f"　{p}%　{_bar(p)}" if p is not None else ""
     # 依案別選 log 來源：事故走 Ray Tune/Train（ray_results）；freeway 走 ultralytics
     if case == "accident":
         # 涵蓋 TAD 主線、圖片集 CNN、軌跡對照；取 mtime 最新的 run（正在跑的會顯示）
@@ -423,14 +668,14 @@ def components_state():
     return {
         "data": comp(
             data_tasks > 0 or prog is not None,
-            (f"追蹤中 {prog[0]}/{prog[1]} 支（{prog[2]}%）{tag}" if prog
+            (f"處理中 {prog[0]}/{prog[1]} 項{tag}{_pct(prog[2])}" if prog
              else f"處理中 {data_tasks} 個 batch task{tag}" if data_tasks
              else "閒置（等待前處理）"),
             "把資料分成 訓練／驗證／測試 三份",
             data_log),
         "tune": comp(
             tune_active,
-            f"搜尋中{tag} · trial 訓練中" if tune_active
+            f"搜尋中{tag} · trial 訓練中{_pct(tune_pct)}" if tune_active
             else "閒置（等待超參搜尋）",
             f"正在自動試參數，找最準的設定 · {case_zh}"
             if tune_active and case_zh
@@ -438,7 +683,7 @@ def components_state():
             tune_log),
         "train": comp(
             train_active,
-            f"{train_n} 個 worker 訓練中{tag}" if train_active
+            f"{train_n} 個 worker 訓練中{tag}{_pct(train_pct)}" if train_active
             else "閒置（等待正式訓練）",
             f"正在用最佳設定正式訓練 · {case_zh}（用 GPU）"
             if kind == "train" and case_zh
@@ -446,7 +691,7 @@ def components_state():
             train_log),
         "serve": comp(
             serve_n > 0,
-            f"{serve_n} 個 replica 運行中" if serve_n
+            f"{serve_n} 個 replica 運行中　100%　{_bar(100)}" if serve_n
             else "未啟動（待 serve_dashboard.py）",
             "把訓練好的模型上線，5 個鏡頭即時偵測車流／車禍",
             _serve_camera_log(serve_n > 0)),

@@ -87,8 +87,14 @@ def prepare(root: str = "/workspace/datasets/freeway_yolo",
           f"／val {len(splits['val'])}／test {len(splits['test'])}")
     print(f"[Ray Data] 展開 {len(jobs)} 個處理項，跨叢集分散執行…")
 
+    (out / "_total.txt").write_text(str(len(jobs)))   # 供 MONITOR 進度%
     ds = ray.data.from_items(jobs)
-    results = ds.map(_process).take_all()
+    results, prog = [], out / "_progress.txt"          # 邊處理邊寫進度
+    for r in ds.map(_process).iter_rows():
+        results.append(r)
+        if len(results) % 64 == 0:
+            prog.write_text(str(len(results)))
+    prog.write_text(str(len(results)))
     n_ok = sum(r["ok"] for r in results)
     per = {}
     for r in results:
